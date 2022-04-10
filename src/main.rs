@@ -1,18 +1,11 @@
-use std::borrow::Borrow;
 use std::collections::LinkedList;
 use std::fs::{create_dir, File, Permissions, set_permissions};
 use std::io::Error;
-use std::ops::Add;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-
-use libc::{fork, wait, waitpid};
-use log::{error, info, LevelFilter, log};
-use nix::unistd::chdir;
-
-use crate::utils::mount;
+use log::info;
 
 mod utils;
 
@@ -53,7 +46,7 @@ fn mount_proc() -> Result<(), Error> {
     // mount(target="/newroot/proc", fs="proc", no_exec=True, no_suid=True, no_dev=True)
     let target = String::from("/") + NEW_ROOT_DIR + "/proc";
     create_dir(target.as_str())?;
-    mount(Option::None, target.as_str(), Option::from("proc"), [
+    utils::mount(Option::None, target.as_str(), Option::from("proc"), [
         utils::MountFlag::NoSuid,
         utils::MountFlag::NoDev,
         utils::MountFlag::NoExec

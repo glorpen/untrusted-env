@@ -1,6 +1,8 @@
+
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Error, Write};
+use std::ops::{BitOr, BitOrAssign};
 use std::path::Path;
 
 use libc::{getgid, getuid, gid_t, uid_t};
@@ -41,6 +43,32 @@ pub enum MountFlag {
     Private,
 }
 
+impl BitOr<MountFlag> for MsFlags {
+    type Output = MsFlags;
+
+    fn bitor(self, rhs: MountFlag) -> Self::Output {
+        fn as_mount_flag(flag: MountFlag) -> MsFlags {
+            return match flag {
+                MountFlag::Readonly => MsFlags::MS_RDONLY,
+                MountFlag::NoExec => MsFlags::MS_NOEXEC,
+                MountFlag::NoSuid => MsFlags::MS_NOSUID,
+                MountFlag::NoDev => MsFlags::MS_NODEV,
+                MountFlag::Recursive => MsFlags::MS_REC,
+                MountFlag::Silent => MsFlags::MS_SILENT,
+                MountFlag::Private => MsFlags::MS_PRIVATE
+            }
+        }
+
+        return self | as_mount_flag(rhs);
+    }
+}
+
+impl BitOrAssign<MountFlag> for MsFlags {
+    fn bitor_assign(&mut self, rhs: MountFlag) {
+        *self = *self | rhs;
+    }
+}
+
 pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl IntoIterator<Item=MountFlag>) -> nix::Result<()> {
     let mut combined_flags: MsFlags = MsFlags::empty();
     let mut combined_names = String::new();
@@ -51,17 +79,8 @@ pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl I
     }
 
     for flag in flags {
-        combined_flags |= match flag {
-            MountFlag::Readonly => MsFlags::MS_RDONLY,
-            MountFlag::NoExec => MsFlags::MS_NOEXEC,
-            MountFlag::NoSuid => MsFlags::MS_NOSUID,
-            MountFlag::NoDev => MsFlags::MS_NODEV,
-            MountFlag::Recursive => MsFlags::MS_REC,
-            MountFlag::Silent => MsFlags::MS_SILENT,
-            MountFlag::Private => MsFlags::MS_PRIVATE
-        };
-
         combined_names += &*format!(", {:?}", flag);
+        combined_flags |= flag;
     }
 
     let local_source = source.unwrap_or(target);
