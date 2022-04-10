@@ -1,8 +1,6 @@
-
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Error, Write};
-use std::ops::{BitOr, BitOrAssign};
 use std::path::Path;
 
 use libc::{getgid, getuid, gid_t, uid_t};
@@ -43,61 +41,37 @@ pub enum MountFlag {
     Private,
 }
 
-impl BitOr<MountFlag> for MsFlags {
-    type Output = MsFlags;
-
-    fn bitor(self, rhs: MountFlag) -> Self::Output {
-        fn as_mount_flag(flag: MountFlag) -> MsFlags {
-            return match flag {
-                MountFlag::Readonly => MsFlags::MS_RDONLY,
-                MountFlag::NoExec => MsFlags::MS_NOEXEC,
-                MountFlag::NoSuid => MsFlags::MS_NOSUID,
-                MountFlag::NoDev => MsFlags::MS_NODEV,
-                MountFlag::Recursive => MsFlags::MS_REC,
-                MountFlag::Silent => MsFlags::MS_SILENT,
-                MountFlag::Private => MsFlags::MS_PRIVATE
-            }
-        }
-
-        return self | as_mount_flag(rhs);
+pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl IntoIterator<Item=MountFlag>, data: Option<&str>) -> nix::Result<()> {
+    fn as_mount_flag(flag: MountFlag) -> MsFlags {
+        return match flag {
+            MountFlag::Readonly => MsFlags::MS_RDONLY,
+            MountFlag::NoExec => MsFlags::MS_NOEXEC,
+            MountFlag::NoSuid => MsFlags::MS_NOSUID,
+            MountFlag::NoDev => MsFlags::MS_NODEV,
+            MountFlag::Recursive => MsFlags::MS_REC,
+            MountFlag::Silent => MsFlags::MS_SILENT,
+            MountFlag::Private => MsFlags::MS_PRIVATE
+        };
     }
-}
 
-impl BitOrAssign<MountFlag> for MsFlags {
-    fn bitor_assign(&mut self, rhs: MountFlag) {
-        *self = *self | rhs;
-    }
-}
-
-pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl IntoIterator<Item=MountFlag>) -> nix::Result<()> {
-    let mut combined_flags: MsFlags = MsFlags::empty();
-    let mut combined_names = String::new();
+    let mut combined_flags: MsFlags = flags.into_iter().fold(MsFlags::empty(), |acc, f: MountFlag| {
+        return acc | as_mount_flag(f);
+    });
 
     if fs.is_none() {
         combined_flags |= MsFlags::MS_BIND;
-        combined_names += &*format!(", Bind");
-    }
-
-    for flag in flags {
-        combined_names += &*format!(", {:?}", flag);
-        combined_flags |= flag;
     }
 
     let local_source = source.unwrap_or(target);
 
-    log::info!("Mounting {:?} to {:?} with fs:{:?} and flags:[{}]",
-        local_source,
-        target,
-        fs,
-        combined_names.strip_prefix(", ").unwrap_or("")
-    );
+    log::info!("Mounting {:?} to {:?} with fs:{:?}", local_source, target, fs);
 
     return nix::mount::mount(
         Option::from(local_source),
         target,
         fs,
         combined_flags,
-        None::<&Path>,
+        data,
     );
 }
 
@@ -134,22 +108,23 @@ pub enum Namespace {
     // CLONE_NEWTIME
 }
 
-fn convert_to_clone_flags(namespaces: impl IntoIterator<Item=Namespace>) -> CloneFlags {
-    return namespaces.into_iter()
-        .fold(CloneFlags::empty(), |acc, namespace: Namespace| {
-            return acc | match namespace {
-                Namespace::Pid => CloneFlags::CLONE_NEWPID,
-                Namespace::Mount => CloneFlags::CLONE_NEWNS,
-                Namespace::User => CloneFlags::CLONE_NEWUSER,
-                Namespace::Network => CloneFlags::CLONE_NEWNET,
-                Namespace::Uts => CloneFlags::CLONE_NEWUTS,
-                Namespace::Ipc => CloneFlags::CLONE_NEWIPC
-            };
-        });
-}
 
 pub fn unshare(namespaces: impl IntoIterator<Item=Namespace>) -> nix::Result<()> {
-    return nix::sched::unshare(convert_to_clone_flags(namespaces));
+    fn as_clone_flag(namespace: Namespace) -> CloneFlags {
+        return match namespace {
+            Namespace::Pid => CloneFlags::CLONE_NEWPID,
+            Namespace::Mount => CloneFlags::CLONE_NEWNS,
+            Namespace::User => CloneFlags::CLONE_NEWUSER,
+            Namespace::Network => CloneFlags::CLONE_NEWNET,
+            Namespace::Uts => CloneFlags::CLONE_NEWUTS,
+            Namespace::Ipc => CloneFlags::CLONE_NEWIPC
+        };
+    }
+    info!("Unsharing");
+    return nix::sched::unshare(namespaces.into_iter()
+        .fold(CloneFlags::empty(), |acc, namespace: Namespace| {
+            return acc | as_clone_flag(namespace);
+        }));
 }
 
 pub fn fork(child_body: impl FnOnce()) -> Result<Pid, Errno> {

@@ -1,0 +1,19 @@
+[package]
+name = "untrusted-env"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+#syscalls = "0.5.0"
+#sys-mount = "1.5.1"
+#unshare = "0.7.0"
+libc = "0.2.122"
+nix = "0.23.1"
+
+log = "0.4.16"
+stderrlog = "0.5.1"
+
+strum = "0.24.0"
+strum_macros = "0.24.0"

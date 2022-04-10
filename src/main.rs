@@ -1,11 +1,13 @@
+use std::borrow::Borrow;
 use std::collections::LinkedList;
-use std::fs::{create_dir, File, Permissions, set_permissions};
+use std::fs::{create_dir, create_dir_all, File, Permissions, set_permissions};
 use std::io::Error;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use log::info;
+use nix::sys::stat::{Mode, SFlag};
 
 mod utils;
 
@@ -22,12 +24,12 @@ fn newroot() -> Result<(), Error> {
         utils::MountFlag::NoSuid,
         utils::MountFlag::NoDev,
         utils::MountFlag::Recursive
-    ])?;
+    ], None)?;
 
     create_dir(new_root)?;
     create_dir(old_root)?;
 
-    utils::mount(Option::from(new_root), new_root, Option::from("tmpfs"), [])?;
+    utils::mount(Option::from(new_root), new_root, Option::from("tmpfs"), [], None)?;
     utils::pivot_root(ROOT, old_root)?;
 
     return Ok(());
@@ -50,7 +52,51 @@ fn mount_proc() -> Result<(), Error> {
         utils::MountFlag::NoSuid,
         utils::MountFlag::NoDev,
         utils::MountFlag::NoExec
-    ]).expect("mounting proc fs");
+    ], None).expect("mounting proc fs");
+
+    return Ok(());
+}
+
+fn mount_dev() -> Result<(), Error> {
+    let target_dev = String::from("/") + NEW_ROOT_DIR + "/dev";
+    let source_dev = String::from("/") + OLD_ROOT_DIR + "/dev";
+    let target_pts = target_dev.to_owned() + "/pts";
+    let target_shm = target_dev.to_owned() + "/shm";
+
+    fn create_dev_dir(path: &str) -> Result<(), Error> {
+        create_dir(path)?;
+        set_permissions(path, Permissions::from_mode(0o755))?;
+        return Ok(());
+    }
+
+    create_dev_dir(target_dev.as_str())?;
+    create_dev_dir(target_shm.as_str())?;
+
+    create_dev_dir(target_pts.as_str())?;
+    utils::mount(None, target_pts.as_str(), Option::from("devpts"), [
+        utils::MountFlag::NoSuid,
+        utils::MountFlag::NoExec
+    ], Option::Some("newinstance,ptmxmode=0666,mode=620"))?;
+
+    for name in ["dri", "null", "zero", "full", "random", "urandom", "tty"] {
+        let source = format!("{}/{}", source_dev, name);
+        let source_path = Path::new(source.as_str());
+
+        if ! source_path.exists() {
+            continue;
+        }
+        let target = format!("{}/{}", target_dev, name);
+
+        if source_path.is_dir() {
+            create_dev_dir(target.as_str())?;
+        } else {
+            File::create(target.as_str())?;
+        }
+        utils::mount(Option::from(source.as_str()), target.as_str(), None, [
+            utils::MountFlag::Recursive,
+            utils::MountFlag::Silent,
+        ], None)?;
+    }
 
     return Ok(());
 }
@@ -59,19 +105,24 @@ fn mount_host(host_path: &str, container_path: Option<&str>, readonly: bool) -> 
     let real_host_path = get_canonical_path([OLD_ROOT_DIR, host_path]);
     let local_container_path = String::from("/") + NEW_ROOT_DIR + container_path.unwrap_or(host_path);
 
-    info!("Creating dir {}", local_container_path);
-    create_dir(local_container_path.as_str())?;
-    set_permissions(local_container_path.as_str(), Permissions::from_mode(0o755))?;
+    if Path::new(real_host_path.as_str()).is_dir() {
+        info!("Creating dir {}", local_container_path);
+        create_dir_all(local_container_path.as_str())?;
+    } else {
+        info!("Creating file {}", local_container_path);
+        create_dir_all(Path::new(local_container_path.as_str()).parent().unwrap().to_str().unwrap())?;
+        File::create(local_container_path.as_str())?;
+    }
 
     let mut mount_flags = LinkedList::from([
         utils::MountFlag::Recursive,
-        utils::MountFlag::Silent
+        utils::MountFlag::Silent,
+        utils::MountFlag::NoDev
     ]);
     if readonly {
         mount_flags.push_back(utils::MountFlag::Readonly);
     }
-    utils::mount(Option::from(real_host_path.as_str()), local_container_path.as_str(), Option::None, mount_flags)
-        .expect("mounting host path");
+    utils::mount(Option::from(real_host_path.as_str()), local_container_path.as_str(), Option::None, mount_flags, None)?;
 
     return Ok(());
 }
@@ -86,7 +137,7 @@ fn cleanup_newroot() -> Result<(), Error> {
         utils::MountFlag::Silent,
         utils::MountFlag::Recursive,
         utils::MountFlag::Private
-    ])?;
+    ], None)?;
     utils::umount2(old_root.as_str(), [
         utils::UmountFlag::Detach
     ])?;
@@ -104,17 +155,21 @@ fn cleanup_newroot() -> Result<(), Error> {
 fn child() {
     newroot().unwrap();
 
-    mount_host("/lib", Option::None, true).unwrap();
-    mount_host("/lib32", Option::None, true).unwrap();
-    mount_host("/lib64", Option::None, true).unwrap();
-    mount_host("/bin", Option::None, true).unwrap();
-    mount_host("/usr", Option::None, true).unwrap();
-
     mount_proc().unwrap();
+    mount_dev().unwrap();
+
+    for name in [
+        "/lib", "/lib32", "/lib64", "/bin", "/usr",
+        "/etc/ld.so.conf", "/etc/ld.so.cache", "/etc/ld.so.conf.d",
+        "/etc/bash", "/etc/bash_completion.d"
+    ] {
+        info!("creating {}", name);
+        mount_host(name, Option::None, true).unwrap();
+    }
 
     cleanup_newroot().unwrap();
 
-    std::process::Command::new("/bin/ps").args(["aux"]).spawn().unwrap().wait().unwrap();
+    std::process::Command::new("bash").spawn().unwrap().wait().unwrap();
 }
 
 fn main() {
