@@ -1,70 +1,35 @@
-use std::ffi::{CStr, CString};
-use std::fmt;
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
 use std::fs::File;
-use std::io::{Error, Seek, Write};
-use std::ops::Add;
+use std::io::{Error, Write};
 use std::path::Path;
-use strum_macros::Display;
 
-use libc::{c_char, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, getgid, getuid, gid_t, MNT_DETACH, MS_BIND, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC, MS_SILENT, pid_t, uid_t};
+use libc::{getgid, getuid, gid_t, uid_t};
 use log::info;
-
-mod ffi {
-    use libc::{c_char, c_int};
-
-    extern {
-        pub fn pivot_root(new_root: *const c_char, put_old: *const c_char) -> c_int;
-    }
-}
-
-macro_rules! make_c_string {
-    ($str:expr) => {
-        CString::new($str).expect("new string")
-    };
-}
-
-macro_rules! make_c_path {
-    ($path:expr) => {
-        make_c_string!($path.to_str().expect("path to string"))
-    };
-}
+use nix::errno::Errno;
+use nix::mount::{MntFlags, MsFlags};
+use nix::sched::CloneFlags;
+use nix::unistd::{ForkResult, Pid};
+use strum_macros::Display;
 
 pub enum UmountFlag {
     Detach
 }
 
-pub fn pivot_root(new_root: &str, old_root: &str) -> Result<(), Error> {
-    let c_new_root = make_c_string!(new_root);
-    let c_old_root = make_c_string!(old_root);
-
-    if unsafe {
-        ffi::pivot_root(
-            c_new_root.as_ptr(),
-            c_old_root.as_ptr(),
-        )
-    } == -1 {
-        return Err(Error::last_os_error());
-    }
-
-    return Ok(());
+pub fn pivot_root(new_root: &str, old_root: &str) -> nix::Result<()> {
+    info!("Changing root to {} and moving current one to {}", new_root, old_root);
+    return nix::unistd::pivot_root(new_root, old_root);
 }
 
-pub fn umount2(path: &str, flags: impl IntoIterator<Item=UmountFlag>) -> Result<(), Error> {
-    let combined_flags = flags.into_iter().fold(0, |acc, flag: UmountFlag| {
-        return acc | match flag { UmountFlag::Detach => MNT_DETACH };
+pub fn umount2(path: &str, flags: impl IntoIterator<Item=UmountFlag>) -> nix::Result<()> {
+    let combined_flags = flags.into_iter().fold(MntFlags::empty(), |acc, flag: UmountFlag| {
+        return acc | match flag { UmountFlag::Detach => MntFlags::MNT_DETACH };
     });
-    let c_path = make_c_string!(path);
 
-    info!("Unmounting {:?}", c_path);
+    info!("Unmounting {}", path);
 
-    if unsafe { libc::umount2(c_path.as_ptr(), combined_flags) } == -1 {
-        return Err(Error::last_os_error());
-    }
-    return Ok(());
+    return nix::mount::umount2(path, combined_flags);
 }
 
-// #[derive(strum_macros::EnumString)]
 #[derive(Display, Debug)]
 pub enum MountFlag {
     Readonly,
@@ -76,60 +41,53 @@ pub enum MountFlag {
     Private,
 }
 
-pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl IntoIterator<Item=MountFlag>) -> Result<(), Error> {
-    let mut combined_flags: nix::mount::MsFlags = nix::mount::MsFlags::empty();
+pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl IntoIterator<Item=MountFlag>) -> nix::Result<()> {
+    let mut combined_flags: MsFlags = MsFlags::empty();
     let mut combined_names = String::new();
 
     if fs.is_none() {
-        combined_flags |= nix::mount::MsFlags::MS_BIND;
+        combined_flags |= MsFlags::MS_BIND;
         combined_names += &*format!(", Bind");
     }
 
     for flag in flags {
         combined_flags |= match flag {
-            MountFlag::Readonly => nix::mount::MsFlags::MS_RDONLY,
-            MountFlag::NoExec => nix::mount::MsFlags::MS_NOEXEC,
-            MountFlag::NoSuid => nix::mount::MsFlags::MS_NOSUID,
-            MountFlag::NoDev => nix::mount::MsFlags::MS_NODEV,
-            MountFlag::Recursive => nix::mount::MsFlags::MS_REC,
-            MountFlag::Silent => nix::mount::MsFlags::MS_SILENT,
-            MountFlag::Private => nix::mount::MsFlags::MS_PRIVATE
+            MountFlag::Readonly => MsFlags::MS_RDONLY,
+            MountFlag::NoExec => MsFlags::MS_NOEXEC,
+            MountFlag::NoSuid => MsFlags::MS_NOSUID,
+            MountFlag::NoDev => MsFlags::MS_NODEV,
+            MountFlag::Recursive => MsFlags::MS_REC,
+            MountFlag::Silent => MsFlags::MS_SILENT,
+            MountFlag::Private => MsFlags::MS_PRIVATE
         };
 
         combined_names += &*format!(", {:?}", flag);
     }
 
-    let c_src = make_c_string!(source.unwrap_or(target));
-    let c_target = make_c_string!(target);
-    let c_fs = fs.map_or(CString::default(), |t| { return make_c_string!(t) });
+    let local_source = source.unwrap_or(target);
 
     log::info!("Mounting {:?} to {:?} with fs:{:?} and flags:[{}]",
-        c_src,
-        c_target,
-        c_fs,
+        local_source,
+        target,
+        fs,
         combined_names.strip_prefix(", ").unwrap_or("")
     );
 
-    nix::mount::mount(Option::from(source.unwrap_or(target)), target, fs, combined_flags, None::<&Path>)?;
-
-    // if unsafe {
-    //     libc::mount(
-    //         c_src.as_ptr(),
-    //         c_target.as_ptr(),
-    //         c_fs.as_ptr(),
-    //         combined_flags,
-    //         std::ptr::null(),
-    //     )
-    // } == -1 {
-    //     return Err(Error::last_os_error());
-    // }
-    return Ok(());
+    return nix::mount::mount(
+        Option::from(local_source),
+        target,
+        fs,
+        combined_flags,
+        None::<&Path>,
+    );
 }
 
 pub fn write_uid_gid_map(uid: uid_t, gid: gid_t) -> Result<(), Error> {
     {
-        let mut f = File::options().write(true).open("/proc/self/setgroups")?;
-        f.write_all("deny\n".as_ref())?;
+        let f = File::options().write(true).open("/proc/self/setgroups");
+        if f.is_ok() {
+            f.unwrap().write_all("deny\n".as_ref())?;
+        }
     }
 
     for (name, id) in [("uid_map", uid), ("gid_map", gid)] {
@@ -151,37 +109,41 @@ pub enum Namespace {
     Mount,
     User,
     Network,
-    Uts,
     // separate hostname
+    Uts,
     Ipc,
     // CLONE_NEWTIME
 }
 
-pub fn unshare(namespaces: impl IntoIterator<Item=Namespace>) -> Result<(), Error> {
-    let combined_flags = namespaces.into_iter().fold(0, |acc, namespace: Namespace| {
-        return acc | match namespace {
-            Namespace::Pid => CLONE_NEWPID,
-            Namespace::Mount => CLONE_NEWNS,
-            Namespace::User => CLONE_NEWUSER,
-            Namespace::Network => CLONE_NEWNET,
-            Namespace::Uts => CLONE_NEWUTS,
-            Namespace::Ipc => CLONE_NEWIPC
-        };
-    });
-    if unsafe { libc::unshare(combined_flags) } == -1 {
-        return Err(Error::last_os_error());
-    }
-    return Ok(());
+fn convert_to_clone_flags(namespaces: impl IntoIterator<Item=Namespace>) -> CloneFlags {
+    return namespaces.into_iter()
+        .fold(CloneFlags::empty(), |acc, namespace: Namespace| {
+            return acc | match namespace {
+                Namespace::Pid => CloneFlags::CLONE_NEWPID,
+                Namespace::Mount => CloneFlags::CLONE_NEWNS,
+                Namespace::User => CloneFlags::CLONE_NEWUSER,
+                Namespace::Network => CloneFlags::CLONE_NEWNET,
+                Namespace::Uts => CloneFlags::CLONE_NEWUTS,
+                Namespace::Ipc => CloneFlags::CLONE_NEWIPC
+            };
+        });
 }
 
-pub fn fork(child_body: impl FnOnce()) -> Result<pid_t, Error> {
-    let ret = unsafe { libc::fork() };
-    if ret == -1 {
-        return Err(Error::last_os_error());
+pub fn unshare(namespaces: impl IntoIterator<Item=Namespace>) -> nix::Result<()> {
+    return nix::sched::unshare(convert_to_clone_flags(namespaces));
+}
+
+pub fn fork(child_body: impl FnOnce()) -> Result<Pid, Errno> {
+    match unsafe { nix::unistd::fork() } {
+        Ok(ForkResult::Child) => {
+            child_body();
+            std::process::exit(0);
+        }
+        Ok(ForkResult::Parent { child, .. }) => {
+            return Ok(child);
+        }
+        Err(err) => {
+            return Err(err);
+        }
     }
-    if ret == 0 {
-        child_body();
-        std::process::exit(0);
-    }
-    return Ok(ret);
 }

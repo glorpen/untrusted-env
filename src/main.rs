@@ -6,12 +6,12 @@ use std::ops::Add;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
 use std::path::{Path, PathBuf};
-use std::ptr::null;
+
 
 use libc::{fork, wait, waitpid};
 use log::{error, info, LevelFilter, log};
 use nix::unistd::chdir;
-use crate::MyError::NoneError;
+
 use crate::utils::mount;
 
 mod utils;
@@ -20,20 +20,8 @@ const NEW_ROOT_DIR: &str = "new-root";
 const OLD_ROOT_DIR: &str = "old-root";
 const ROOT: &str = "/tmp";
 
-#[derive(Debug)]
-enum MyError {
-    NoneError,
-    IOError(std::io::Error)
-}
 
-impl From<std::io::Error> for MyError {
-    fn from(err: std::io::Error) -> MyError {
-        MyError::IOError(err)
-    }
-}
-
-
-fn newroot() -> Result<(), MyError> {
+fn newroot() -> Result<(), Error> {
     let new_root = &*format!("{}/{}", ROOT, NEW_ROOT_DIR);
     let old_root = &*format!("{}/{}", ROOT, OLD_ROOT_DIR);
 
@@ -43,8 +31,8 @@ fn newroot() -> Result<(), MyError> {
         utils::MountFlag::Recursive
     ])?;
 
-    create_dir(new_root).expect("Creating new root dir");
-    create_dir(old_root).expect("Creating new root dir");
+    create_dir(new_root)?;
+    create_dir(old_root)?;
 
     utils::mount(Option::from(new_root), new_root, Option::from("tmpfs"), [])?;
     utils::pivot_root(ROOT, old_root)?;
@@ -52,15 +40,15 @@ fn newroot() -> Result<(), MyError> {
     return Ok(());
 }
 
-fn get_canonical_path<'x>(items: impl IntoIterator<Item=&'x str>) -> Result<String, MyError> {
+fn get_canonical_path<'x>(items: impl IntoIterator<Item=&'x str>) -> String {
     let mut path = PathBuf::from("/");
     path.extend(items.into_iter().map(|p: &str| {
         return p.strip_prefix("/").unwrap_or(p);
     }));
-    return Ok(String::from(path.canonicalize()?.to_str().ok_or(NoneError)?));
+    return String::from(path.canonicalize().unwrap().to_str().unwrap());
 }
 
-fn mount_proc() -> Result<(), MyError> {
+fn mount_proc() -> Result<(), Error> {
     // os.mkdir("/newroot/proc")
     // mount(target="/newroot/proc", fs="proc", no_exec=True, no_suid=True, no_dev=True)
     let target = String::from("/") + NEW_ROOT_DIR + "/proc";
@@ -69,14 +57,13 @@ fn mount_proc() -> Result<(), MyError> {
         utils::MountFlag::NoSuid,
         utils::MountFlag::NoDev,
         utils::MountFlag::NoExec
-    ])?;
+    ]).expect("mounting proc fs");
 
     return Ok(());
 }
 
-fn mount_host(host_path: &str, container_path: Option<&str>, readonly: bool) -> Result<(), MyError> {
-    let real_host_path = get_canonical_path([OLD_ROOT_DIR, host_path])
-        .expect("resolving host path");
+fn mount_host(host_path: &str, container_path: Option<&str>, readonly: bool) -> Result<(), Error> {
+    let real_host_path = get_canonical_path([OLD_ROOT_DIR, host_path]);
     let local_container_path = String::from("/") + NEW_ROOT_DIR + container_path.unwrap_or(host_path);
 
     info!("Creating dir {}", local_container_path);
@@ -90,12 +77,13 @@ fn mount_host(host_path: &str, container_path: Option<&str>, readonly: bool) -> 
     if readonly {
         mount_flags.push_back(utils::MountFlag::Readonly);
     }
-    utils::mount(Option::from(real_host_path.as_str()), local_container_path.as_str(), Option::None, mount_flags)?;
+    utils::mount(Option::from(real_host_path.as_str()), local_container_path.as_str(), Option::None, mount_flags)
+        .expect("mounting host path");
 
     return Ok(());
 }
 
-fn cleanup_newroot() -> Result<(), MyError> {
+fn cleanup_newroot() -> Result<(), Error> {
 //     remove oldroot and make newroot a root
 // # make old root private so it does umount not propagate
     let old_root = format!("/{}", OLD_ROOT_DIR);
@@ -105,33 +93,24 @@ fn cleanup_newroot() -> Result<(), MyError> {
         utils::MountFlag::Silent,
         utils::MountFlag::Recursive,
         utils::MountFlag::Private
-    ]).expect("mount old root");
-// mount(target="/oldroot", silent=True, recursive=True, private=True)
+    ])?;
     utils::umount2(old_root.as_str(), [
         utils::UmountFlag::Detach
-    ]).expect("umount old root");
-// umount2("/oldroot", Flag.MNT_DETACH)
+    ])?;
 
-    let current_root = File::open("/").expect("open /").into_raw_fd();
-// fd_oldroot = os.open("/", os.O_PATH)
-    utils::pivot_root(new_root.as_str(), new_root.as_str()).expect("pivot");
-    // TODO: nix pivot root
-// pivot_root("/newroot", "/newroot")
+    let current_root = File::open("/")?.into_raw_fd();
+    utils::pivot_root(new_root.as_str(), new_root.as_str())?;
 
-    nix::unistd::fchdir(current_root).expect("asd");
-// os.fchdir(fd_oldroot)
-// os.close(fd_oldroot)
-    nix::mount::umount2(".", nix::mount::MntFlags::MNT_DETACH).expect("asd2");
-// umount2(".", Flag.MNT_DETACH)
-    nix::unistd::chdir("/").expect("qwe");
-// os.chdir("/")
+    nix::unistd::fchdir(current_root)?;
+    nix::mount::umount2(".", nix::mount::MntFlags::MNT_DETACH)?;
+    nix::unistd::chdir("/")?;
 
     return Ok(());
 }
 
 fn child() {
-    println!("child");
     newroot().unwrap();
+
     mount_host("/lib", Option::None, true).unwrap();
     mount_host("/lib32", Option::None, true).unwrap();
     mount_host("/lib64", Option::None, true).unwrap();
@@ -162,23 +141,5 @@ fn main() {
     utils::write_uid_gid_map(uid, gid).expect("setting uid/gid map failed");
 
     let child_pid = utils::fork(child).expect("could not fork");
-
-    unsafe { waitpid(child_pid, std::ptr::null_mut(), 0); }
-
-    // let mut o = unshare::Command::new("asd");
-    // o.unshare([
-    //     unshare::Namespace::Pid,
-    //     unshare::Namespace::Mount,
-    //     unshare::Namespace::User,
-    //     unshare::Namespace::Net,
-    //     unshare::Namespace::Uts,
-    //     unshare::Namespace::Ipc
-    //     // unshare::Namespace::Time
-    // ].iter());
-    // o.set_id_maps();
-
-    // o.spawn().ok();
-    // o.pivot_root();
-
-    println!("Hello, world!");
+    nix::sys::wait::waitpid(child_pid, None).unwrap();
 }
