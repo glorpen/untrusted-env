@@ -1,13 +1,11 @@
-use std::borrow::Borrow;
 use std::collections::LinkedList;
 use std::fs::{create_dir, create_dir_all, File, Permissions, set_permissions};
 use std::io::Error;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use log::info;
-use nix::sys::stat::{Mode, SFlag};
 
 mod utils;
 
@@ -35,14 +33,6 @@ fn newroot() -> Result<(), Error> {
     return Ok(());
 }
 
-fn get_canonical_path<'x>(items: impl IntoIterator<Item=&'x str>) -> String {
-    let mut path = PathBuf::from("/");
-    path.extend(items.into_iter().map(|p: &str| {
-        return p.strip_prefix("/").unwrap_or(p);
-    }));
-    return String::from(path.canonicalize().unwrap().to_str().unwrap());
-}
-
 fn mount_proc() -> Result<(), Error> {
     // os.mkdir("/newroot/proc")
     // mount(target="/newroot/proc", fs="proc", no_exec=True, no_suid=True, no_dev=True)
@@ -55,6 +45,36 @@ fn mount_proc() -> Result<(), Error> {
     ], None).expect("mounting proc fs");
 
     return Ok(());
+}
+
+fn assure_root_path5<F>(source_root: &str, target_root: &str, source_path: &str, target_path: Option<&str>, then: F) -> Result<(), Error>
+    where F: FnOnce(&str, &str) -> Result<(), Error> {
+    let local_source_path = String::from(source_root) + source_path;
+    let local_target_path = String::from(target_root) + target_path.unwrap_or(source_path);
+
+    let source = Path::new(local_source_path.as_str());
+
+    if !source.exists() {
+        info!("Source path {} does not exist, skipping.", local_source_path);
+        return Ok(());
+    }
+
+    if source.is_dir() {
+        info!("Creating dir {}.", local_target_path);
+        create_dir_all(local_target_path.as_str())?;
+        // set_permissions(path, Permissions::from_mode(0o755))?;
+    } else {
+        info!("Creating file {}.", local_target_path);
+        create_dir_all(Path::new(local_target_path.as_str()).parent().unwrap().to_str().unwrap())?;
+        File::create(local_target_path.as_str())?;
+    }
+
+    return then(local_source_path.as_str(), local_target_path.as_str());
+}
+
+macro_rules! assure_root_path {
+    ($a1 : expr, $a2 : expr, $a3 : expr, $a4 : expr) => { assure_root_path5($a1, $a2, $a3, None, $a4) };
+    ($a1 : expr, $a2 : expr, $a3 : expr, $a4 : expr, $a5 : expr) => { assure_root_path5($a1, $a2, $a3, $a4, $a5) };
 }
 
 fn mount_dev() -> Result<(), Error> {
@@ -78,41 +98,27 @@ fn mount_dev() -> Result<(), Error> {
         utils::MountFlag::NoExec
     ], Option::Some("newinstance,ptmxmode=0666,mode=620"))?;
 
+    // we cannot mknod as we don't have CAP_MKNOD, mount needed dirs/devices
     for name in ["dri", "null", "zero", "full", "random", "urandom", "tty"] {
-        let source = format!("{}/{}", source_dev, name);
-        let source_path = Path::new(source.as_str());
+        assure_root_path!(source_dev.as_str(), target_dev.as_str(), name, |source, target| {
+            utils::mount(Option::from(source), target, None, [
+                utils::MountFlag::Recursive,
+                utils::MountFlag::Silent,
+            ], None)?;
 
-        if ! source_path.exists() {
-            continue;
-        }
-        let target = format!("{}/{}", target_dev, name);
-
-        if source_path.is_dir() {
-            create_dev_dir(target.as_str())?;
-        } else {
-            File::create(target.as_str())?;
-        }
-        utils::mount(Option::from(source.as_str()), target.as_str(), None, [
-            utils::MountFlag::Recursive,
-            utils::MountFlag::Silent,
-        ], None)?;
+            return Ok(());
+        })?;
     }
 
     return Ok(());
 }
 
 fn mount_host(host_path: &str, container_path: Option<&str>, readonly: bool) -> Result<(), Error> {
-    let real_host_path = get_canonical_path([OLD_ROOT_DIR, host_path]);
-    let local_container_path = String::from("/") + NEW_ROOT_DIR + container_path.unwrap_or(host_path);
+    // let real_host_path = get_canonical_path([OLD_ROOT_DIR, host_path]);
+    // let local_container_path = String::from("/") + NEW_ROOT_DIR + container_path.unwrap_or(host_path);
 
-    if Path::new(real_host_path.as_str()).is_dir() {
-        info!("Creating dir {}", local_container_path);
-        create_dir_all(local_container_path.as_str())?;
-    } else {
-        info!("Creating file {}", local_container_path);
-        create_dir_all(Path::new(local_container_path.as_str()).parent().unwrap().to_str().unwrap())?;
-        File::create(local_container_path.as_str())?;
-    }
+    let source_root = String::from("/") + OLD_ROOT_DIR;
+    let target_root = String::from("/") + NEW_ROOT_DIR;
 
     let mut mount_flags = LinkedList::from([
         utils::MountFlag::Recursive,
@@ -122,9 +128,11 @@ fn mount_host(host_path: &str, container_path: Option<&str>, readonly: bool) -> 
     if readonly {
         mount_flags.push_back(utils::MountFlag::Readonly);
     }
-    utils::mount(Option::from(real_host_path.as_str()), local_container_path.as_str(), Option::None, mount_flags, None)?;
 
-    return Ok(());
+    return assure_root_path!(source_root.as_str(), target_root.as_str(), host_path, container_path, |source, target| {
+        utils::mount(Option::from(source), target, Option::None, mount_flags, None)?;
+        return Ok(());
+    });
 }
 
 fn cleanup_newroot() -> Result<(), Error> {

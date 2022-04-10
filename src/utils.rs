@@ -1,7 +1,6 @@
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Error, Write};
-use std::path::Path;
 
 use libc::{getgid, getuid, gid_t, uid_t};
 use log::info;
