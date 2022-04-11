@@ -1,12 +1,13 @@
 use std::collections::LinkedList;
 use std::fs::{create_dir, create_dir_all, File, Permissions, set_permissions};
-use std::io::Error;
+use std::io::{Error, Write};
 use std::path::Path;
 use log::info;
-use crate::sys::{fork, get_uid_gid, mount, MountFlag, Namespace, pivot_root, umount2, UmountFlag, unshare, write_uid_gid_map};
+use crate::sys::{fork, get_user_info, mount, MountFlag, Namespace, pivot_root, umount2, UmountFlag, unshare, UserInfo, write_uid_gid_map};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
 use nix::unistd::{chdir, fchdir};
+
 
 const NEW_ROOT_DIR: &str = "new-root";
 const OLD_ROOT_DIR: &str = "old-root";
@@ -159,7 +160,7 @@ fn cleanup_newroot() -> Result<(), Error> {
     return Ok(());
 }
 
-fn child() {
+fn child(user_info: UserInfo) {
     newroot().unwrap();
 
     mount_proc().unwrap();
@@ -174,13 +175,28 @@ fn child() {
         mount_host(name, Option::None, true).unwrap();
     }
 
+    write_user_info(user_info)
+        .expect("setting user info");
+
     cleanup_newroot().unwrap();
 
     std::process::Command::new("bash").spawn().unwrap().wait().unwrap();
 }
 
+fn write_user_info(info: UserInfo) -> Result<(), Error> {
+    let mut passwd_file = File::create(format!("/{}/etc/passwd", NEW_ROOT_DIR))?;
+    write!(passwd_file, "{}:x:{}:{}:user:/home:{}\n", info.user.name, info.user.id, info.group.id, info.shell.to_str().unwrap())?;
+    write!(passwd_file, "nobody:x:65534:65534:nobody:/var/empty:/bin/false\n")?;
+
+    let mut group_file = File::create(format!("/{}/etc/group", NEW_ROOT_DIR))?;
+    write!(group_file, "{}:x:{}:{}\n", info.group.name, info.group.id, info.user.name)?;
+    write!(group_file, "nobody:x:65534:{}\n", info.user.name)?;
+
+    return Ok(());
+}
+
 pub fn run() -> Result<(), Error> {
-    let (uid, gid) = get_uid_gid();
+    let info = get_user_info()?;
 
     unshare([
         Namespace::Pid,
@@ -191,9 +207,14 @@ pub fn run() -> Result<(), Error> {
         Namespace::Ipc,
     ])?;
 
-    write_uid_gid_map(uid, gid)?;
+    write_uid_gid_map(
+        info.user.id,
+        info.group.id,
+    )?;
 
-    let child_pid = fork(child)?;
+    let child_pid = fork(|| {
+        child(info);
+    })?;
     nix::sys::wait::waitpid(child_pid, None).unwrap();
 
     return Ok(());

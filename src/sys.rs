@@ -1,13 +1,16 @@
+use std::borrow::Borrow;
+use std::ffi::{CStr, CString};
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{Error, Write};
+use std::path::PathBuf;
 
 use libc::{getgid, getuid, gid_t, uid_t};
 use log::info;
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags};
 use nix::sched::CloneFlags;
-use nix::unistd::{ForkResult, Pid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid};
 use strum_macros::Display;
 
 pub enum UmountFlag {
@@ -74,26 +77,55 @@ pub fn mount(source: Option<&str>, target: &str, fs: Option<&str>, flags: impl I
     );
 }
 
-pub fn write_uid_gid_map(uid: uid_t, gid: gid_t) -> Result<(), Error> {
+pub fn write_uid_gid_map(uid: Uid, gid: Gid) -> Result<(), Error> {
     {
         let f = File::options().write(true).open("/proc/self/setgroups");
         if f.is_ok() {
-            f.unwrap().write_all("deny\n".as_ref())?;
+            f.unwrap().write_all("deny\n".as_bytes())?;
         }
     }
 
-    for (name, id) in [("uid_map", uid), ("gid_map", gid)] {
-        let mut map = File::options().write(true).open(format!("/proc/self/{}", name))?;
-        map.write_all(format!("{} {} 1\n", id, id).as_ref())?;
-    }
+    File::options().write(true).open("/proc/self/uid_map")?
+        .write_all(format!("{} {} 1\n", uid, uid).as_bytes())?;
+
+    File::options().write(true).open("/proc/self/gid_map")?
+        .write_all(format!("{} {} 1\n", gid, gid).as_bytes())?;
 
     return Ok(());
 }
 
-pub fn get_uid_gid() -> (uid_t, gid_t) {
-    unsafe {
-        return (getuid(), getgid());
-    }
+pub struct Group {
+    pub id: Gid,
+    pub name: String
+}
+pub struct User {
+    pub id: Uid,
+    pub name: String
+}
+pub struct UserInfo {
+    pub user: User,
+    pub group: Group,
+    pub shell: PathBuf
+}
+
+pub fn get_user_info() -> Result<UserInfo, Error> {
+    let uid = nix::unistd::getuid();
+    let user = nix::unistd::User::from_uid(uid)?
+        .expect("Current user does not exist");
+    let group = nix::unistd::Group::from_gid(user.gid)?
+        .expect("Current user group does not exist");
+
+    return Ok(UserInfo {
+        shell: user.shell,
+        user: User {
+            id: uid,
+            name: user.name,
+        },
+        group: Group {
+            id: group.gid,
+            name: group.name
+        }
+    });
 }
 
 pub enum Namespace {
