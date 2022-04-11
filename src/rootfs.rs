@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::LinkedList;
 use std::fs::{create_dir, create_dir_all, File, Permissions, set_permissions};
 use std::io::{Error, Write};
@@ -49,8 +50,8 @@ fn mount_proc() -> Result<(), Error> {
 
 fn assure_root_path5<F>(source_root: &str, target_root: &str, source_path: &str, target_path: Option<&str>, then: F) -> Result<(), Error>
     where F: FnOnce(&str, &str) -> Result<(), Error> {
-    let local_source_path = String::from(source_root) + source_path;
-    let local_target_path = String::from(target_root) + target_path.unwrap_or(source_path);
+    let local_source_path = String::from(source_root) + "/" + source_path;
+    let local_target_path = String::from(target_root) + "/" + target_path.unwrap_or(source_path);
 
     let source = Path::new(local_source_path.as_str());
 
@@ -160,11 +161,11 @@ fn cleanup_newroot() -> Result<(), Error> {
     return Ok(());
 }
 
-fn child(user_info: UserInfo) {
-    newroot().unwrap();
+fn child(user_info: &UserInfo) -> Result<(), Error> {
+    newroot()?;
 
-    mount_proc().unwrap();
-    mount_dev().unwrap();
+    mount_proc()?;
+    mount_dev()?;
 
     for name in [
         "/lib", "/lib32", "/lib64", "/bin", "/usr",
@@ -172,18 +173,20 @@ fn child(user_info: UserInfo) {
         "/etc/bash", "/etc/bash_completion.d"
     ] {
         info!("creating {}", name);
-        mount_host(name, Option::None, true).unwrap();
+        mount_host(name, Option::None, true)?;
     }
 
-    write_user_info(user_info)
-        .expect("setting user info");
+    write_user_info(user_info.borrow())?;
 
-    cleanup_newroot().unwrap();
+    cleanup_newroot()?;
 
-    std::process::Command::new("bash").spawn().unwrap().wait().unwrap();
+    std::process::Command::new(user_info.shell.to_str().unwrap()).spawn()?.wait()?;
+    // TODO: handle SIGCHLD as PID1
+
+    return Ok(());
 }
 
-fn write_user_info(info: UserInfo) -> Result<(), Error> {
+fn write_user_info(info: &UserInfo) -> Result<(), Error> {
     let mut passwd_file = File::create(format!("/{}/etc/passwd", NEW_ROOT_DIR))?;
     write!(passwd_file, "{}:x:{}:{}:user:/home:{}\n", info.user.name, info.user.id, info.group.id, info.shell.to_str().unwrap())?;
     write!(passwd_file, "nobody:x:65534:65534:nobody:/var/empty:/bin/false\n")?;
@@ -213,7 +216,7 @@ pub fn run() -> Result<(), Error> {
     )?;
 
     let child_pid = fork(|| {
-        child(info);
+        child(info.borrow()).unwrap();
     })?;
     nix::sys::wait::waitpid(child_pid, None).unwrap();
 
