@@ -9,6 +9,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::IntoRawFd;
 use nix::unistd::{chdir, fchdir};
 
+pub struct RootFs {}
+
+impl RootFs {}
+
+
 
 const NEW_ROOT_DIR: &str = "new-root";
 const OLD_ROOT_DIR: &str = "old-root";
@@ -50,8 +55,11 @@ fn mount_proc() -> Result<(), Error> {
 
 fn assure_root_path5<F>(source_root: &str, target_root: &str, source_path: &str, target_path: Option<&str>, then: F) -> Result<(), Error>
     where F: FnOnce(&str, &str) -> Result<(), Error> {
-    let local_source_path = String::from(source_root) + "/" + source_path;
-    let local_target_path = String::from(target_root) + "/" + target_path.unwrap_or(source_path);
+    let local_source_path = String::from(source_root) + "/" + source_path.strip_prefix("/").unwrap_or(source_path);
+    let local_target_path = String::from(target_root) + "/" + {
+        let path = target_path.unwrap_or(source_path);
+        path.strip_prefix("/").unwrap_or(path)
+    };
 
     let source = Path::new(local_source_path.as_str());
 
@@ -169,8 +177,8 @@ fn child(user_info: &UserInfo) -> Result<(), Error> {
 
     for name in [
         "/lib", "/lib32", "/lib64", "/bin", "/usr",
-        "/etc/ld.so.conf", "/etc/ld.so.cache", "/etc/ld.so.conf.d",
-        "/etc/bash", "/etc/bash_completion.d"
+        "etc/ld.so.conf", "etc/ld.so.cache", "etc/ld.so.conf.d",
+        "etc/bash", "etc/bash_completion.d"
     ] {
         info!("creating {}", name);
         mount_host(name, Option::None, true)?;
