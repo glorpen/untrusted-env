@@ -1,6 +1,9 @@
+extern crate core;
+
 mod sys;
 mod rootfs;
 mod path;
+mod ipc;
 
 
 fn main() {
