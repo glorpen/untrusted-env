@@ -1,13 +1,20 @@
-use std::borrow::{Borrow, BorrowMut};
-
+use std::borrow::BorrowMut;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, stderr, stdout, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
-use libc::STDIN_FILENO;
+use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use nix::errno::Errno;
-use nix::fcntl::OFlag;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
+use nix::unistd::{close, dup2};
+
+#[derive(Debug)]
+pub enum IpcError {
+    UnhandledFd,
+    IoError(Error),
+    Errno(Errno),
+}
 
 struct Messages {
     endpoint_w: File,
@@ -20,35 +27,35 @@ struct Stdio {
     stdin: File,
 }
 
-struct ChildSide {
+pub struct ChildSide {
     parent_io: Stdio,
     messages: Messages,
-    reactor: Reactor,
 }
 
-struct ParentSide {
+pub struct ParentSide {
     child_io: Stdio,
     messages: Messages,
     stdin: File,
-    reactor: Reactor,
-    pending_stdin: Vec<u8>
+    pending_stdin: Vec<u8>,
 }
 
 pub struct Api {
-    parent: ParentSide,
-    child: ChildSide,
+    pub parent: ParentSide,
+    pub child: ChildSide,
 }
 
-struct Reactor {
+pub struct Reactor {
     epoll_fd: RawFd,
 }
 
-trait ReactorHandler {
+pub trait ReactorHandler: Sized {
     fn get_watchable_read_files(&self) -> Vec<&File>;
 
     fn get_total_watchable_files(&self) -> usize;
 
-    fn on_fd_event(&mut self, fd: RawFd) -> Result<(), Error>;
+    fn on_fd_event(&mut self, reactor: &Reactor, fd: RawFd) -> Result<(), IpcError>;
+
+    fn close(&self) -> Result<(), Error>;
 }
 
 impl Reactor {
@@ -81,24 +88,25 @@ impl Reactor {
         return Ok(());
     }
 
-    fn run(&self, handler: &mut impl ReactorHandler) {
+    pub fn run(&mut self, handler: &mut impl ReactorHandler) -> Result<(), IpcError> {
         let mut event_in = Some(EpollEvent::new(EpollFlags::EPOLLIN, 0));
         let read_files = handler.get_watchable_read_files();
-        let mut events: Vec<EpollEvent> = Vec::with_capacity(handler.get_total_watchable_files());
+        let mut events: Vec<EpollEvent> = vec![EpollEvent::empty(); handler.get_total_watchable_files()];
 
         for read_file in read_files {
-            epoll_ctl(self.epoll_fd, EpollOp::EpollCtlAdd, read_file.as_raw_fd(), event_in.borrow_mut()).unwrap();
+            epoll_ctl(self.epoll_fd, EpollOp::EpollCtlAdd, read_file.as_raw_fd(), event_in.borrow_mut())
+                .expect("epoll ctl");
         }
 
         // when writing: write nonblocking until EAGAIN, add EPOLLOUT to watchlist, repeat until done sending, remove EPOLLOUT
 
         loop {
-            let events_count = epoll_wait(self.epoll_fd, &mut events, 1000).unwrap();
+            let events_count = epoll_wait(self.epoll_fd, &mut events, 1000).expect("epoll wait");
             for i in 0..events_count {
                 let fd = events[i].data() as RawFd;
 
                 // TODO: gracefully handle errors
-                handler.on_fd_event(fd).unwrap();
+                handler.on_fd_event(self, fd).expect("fd event");
             }
         }
     }
@@ -155,45 +163,63 @@ impl Reactor {
     }
 }
 
+fn fd_as_file(fd: RawFd) -> File {
+    unsafe { File::from_raw_fd(fd) }
+}
+
 impl Api {
     //noinspection DuplicatedCode
     pub fn init() -> Api {
         let (parent_api_rd, child_api_wr) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
         let (parent_api_wr, child_api_rd) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
 
-        let (parent_stdout_rd, child_stdout_wr) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
-        let (parent_stdin_wr, child_stdin_rd) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
-        let (parent_stderr_rd, child_stderr_wr) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (parent_stdout_rd, child_stdout_wr) = nix::unistd::pipe().unwrap();
+        fcntl(parent_stdout_rd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+        let (parent_stdin_wr, child_stdin_rd) = nix::unistd::pipe().unwrap();
+        fcntl(parent_stdin_wr, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+        let (parent_stderr_rd, child_stderr_wr) = nix::unistd::pipe().unwrap();
+        fcntl(parent_stderr_rd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+
 
         Api {
             parent: ParentSide {
                 messages: Messages {
-                    endpoint_w: unsafe { File::from_raw_fd(parent_api_wr) },
-                    endpoint_r: unsafe { File::from_raw_fd(parent_api_rd) },
+                    endpoint_w: fd_as_file(parent_api_wr),
+                    endpoint_r: fd_as_file(parent_api_rd),
                 },
                 child_io: Stdio {
-                    stdout: unsafe { File::from_raw_fd(parent_stdout_rd) },
-                    stderr: unsafe { File::from_raw_fd(parent_stderr_rd) },
-                    stdin: unsafe { File::from_raw_fd(parent_stdin_wr) },
+                    stdout: fd_as_file(parent_stdout_rd),
+                    stderr: fd_as_file(parent_stderr_rd),
+                    stdin: fd_as_file(parent_stdin_wr),
                 },
-                stdin: unsafe { File::from_raw_fd(STDIN_FILENO) },
-                reactor: Reactor::create(),
+                stdin: fd_as_file(STDIN_FILENO),
 
                 pending_stdin: Vec::new(),
             },
             child: ChildSide {
                 messages: Messages {
-                    endpoint_w: unsafe { File::from_raw_fd(child_api_wr) },
-                    endpoint_r: unsafe { File::from_raw_fd(child_api_rd) },
+                    endpoint_w: fd_as_file(child_api_wr),
+                    endpoint_r: fd_as_file(child_api_rd),
                 },
                 parent_io: Stdio {
-                    stdout: unsafe { File::from_raw_fd(child_stdout_wr) },
-                    stderr: unsafe { File::from_raw_fd(child_stderr_wr) },
-                    stdin: unsafe { File::from_raw_fd(child_stdin_rd) },
+                    stdout: fd_as_file(child_stdout_wr),
+                    stderr: fd_as_file(child_stderr_wr),
+                    stdin: fd_as_file(child_stdin_rd),
                 },
-                reactor: Reactor::create(),
             },
         }
+    }
+}
+
+impl From<Error> for IpcError {
+    fn from(err: Error) -> Self {
+        IpcError::IoError(err)
+    }
+}
+
+impl From<Errno> for IpcError {
+    fn from(err: Errno) -> Self {
+        IpcError::Errno(err)
     }
 }
 
@@ -211,18 +237,75 @@ impl ReactorHandler for ParentSide {
         6
     }
 
-    fn on_fd_event(&mut self, fd: RawFd) -> Result<(), Error> {
-        return if fd == self.stdin.as_raw_fd() {
-            self.reactor.forward_data(
+    fn on_fd_event(&mut self, reactor: &Reactor, fd: RawFd) -> Result<(), IpcError> {
+        if fd == self.stdin.as_raw_fd() {
+            reactor.forward_data(
                 &mut self.stdin, &mut self.pending_stdin, &mut self.child_io.stdin,
-            )
+            )?;
         } else if fd == self.child_io.stderr.as_raw_fd() {
-            self.reactor.forward_data_sync(&mut self.child_io.stderr, stderr())
+            reactor.forward_data_sync(&mut self.child_io.stderr, stderr())?;
         } else if fd == self.child_io.stdout.as_raw_fd() {
-            self.reactor.forward_data_sync(&mut self.child_io.stdout, stdout())
-        } else {
-            // TODO: not an i/o error
-            Err(Error::last_os_error())
-        };
+            reactor.forward_data_sync(&mut self.child_io.stdout, stdout())?;
+        }
+
+        return Err(IpcError::UnhandledFd);
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        close(self.child_io.stdin.as_raw_fd())?;
+        close(self.child_io.stdout.as_raw_fd())?;
+        close(self.child_io.stderr.as_raw_fd())?;
+        close(self.stdin.as_raw_fd())?;
+        close(self.messages.endpoint_r.as_raw_fd())?;
+        close(self.messages.endpoint_w.as_raw_fd())?;
+        return Ok(());
     }
 }
+
+impl ReactorHandler for ChildSide {
+    fn get_watchable_read_files(&self) -> Vec<&File> {
+        vec![
+            &self.messages.endpoint_r
+        ]
+    }
+
+    fn get_total_watchable_files(&self) -> usize {
+        2
+    }
+
+    fn on_fd_event(&mut self, reactor: &Reactor, fd: RawFd) -> Result<(), IpcError> {
+        // messages api
+        Err(IpcError::UnhandledFd)
+    }
+
+    fn close(&self) -> Result<(), Error> {
+        close(self.parent_io.stdin.as_raw_fd())?;
+        close(self.parent_io.stdout.as_raw_fd())?;
+        close(self.parent_io.stderr.as_raw_fd())?;
+        close(self.messages.endpoint_r.as_raw_fd())?;
+        close(self.messages.endpoint_w.as_raw_fd())?;
+        return Ok(());
+    }
+}
+
+impl ChildSide {
+    pub fn setup_stdio(&mut self) -> Result<(), Error> {
+        fn adjust_fd(src: &mut File, current_fd: RawFd) -> Result<(), Error> {
+            dup2(src.as_raw_fd(), current_fd)?;
+            close(src.as_raw_fd())?;
+            *src = fd_as_file(current_fd);
+
+            return Ok(());
+        }
+
+        adjust_fd(&mut self.parent_io.stdin, STDIN_FILENO)?;
+        adjust_fd(&mut self.parent_io.stdout, STDOUT_FILENO)?;
+        adjust_fd(&mut self.parent_io.stderr, STDERR_FILENO)?;
+
+        return Ok(());
+    }
+}
+
+// pub fn run(reactor: &mut Reactor, handler: &impl ReactorHandler) {
+//     reactor.run(handler);
+// }

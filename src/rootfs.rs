@@ -9,6 +9,7 @@ use std::path::Path;
 use log::info;
 use nix::unistd::{chdir, fchdir};
 
+use crate::ipc::{Api, ChildSide, Reactor, ReactorHandler};
 use crate::path::{_Path, NEW_ROOT_DIR, OLD_ROOT_DIR, ROOT_INIT_PATH};
 use crate::sys::{fork, get_user_info, mount, MountFlag, Namespace, pivot_root, umount2, UmountFlag, unshare, UserInfo, write_uid_gid_map};
 
@@ -169,7 +170,10 @@ impl<'x> RootFsView<'x> {
     }
 }
 
-fn child(rootfs: &RootFsView, user_info: &UserInfo) -> Result<(), Error> {
+fn run_stage3(rootfs: &RootFsView, user_info: &UserInfo, api: &mut ChildSide) -> Result<(), Error> {
+    info!("stage3: setup stdio");
+    api.setup_stdio()?;
+
     rootfs.newroot()?;
 
     rootfs.mount_proc()?;
@@ -188,14 +192,22 @@ fn child(rootfs: &RootFsView, user_info: &UserInfo) -> Result<(), Error> {
 
     rootfs.cleanup_newroot()?;
 
+    // nix::mqueue::mq_send(queue, CString::new("test").unwrap().as_bytes(), 1)
+    //     .unwrap();
+    // nix::unistd::write(queue, CString::new("test test").unwrap().as_bytes()).unwrap();
+
+
     std::process::Command::new(user_info.shell.to_str().unwrap()).spawn()?.wait()?;
     // TODO: handle SIGCHLD as PID1
+    let mut reactor = Reactor::create();
+    reactor.run(api).expect("asd");
+
+    // nix::unistd::close(queue).unwrap();
 
     return Ok(());
 }
 
-
-pub fn run() -> Result<(), Error> {
+fn run_stage2(api: &mut ChildSide) -> Result<(), Error> {
     let info = get_user_info()?;
 
     unshare([
@@ -212,7 +224,7 @@ pub fn run() -> Result<(), Error> {
         info.group.id,
     )?;
 
-    let child_pid = fork(|| {
+    fork(|| {
         let init_path = _Path::from_iter([ROOT_INIT_PATH]);
         let init_new_path = _Path::from_iter([ROOT_INIT_PATH, NEW_ROOT_DIR]);
         let init_old_path = _Path::from_iter([ROOT_INIT_PATH, OLD_ROOT_DIR]);
@@ -227,9 +239,26 @@ pub fn run() -> Result<(), Error> {
             old_path: &old_path,
         };
 
-        child(&rootfs, info.borrow()).unwrap();
+        run_stage3(&rootfs, info.borrow(), api).unwrap();
     })?;
-    nix::sys::wait::waitpid(child_pid, None).unwrap();
+
+    return Ok(());
+}
+
+pub fn run() -> Result<(), Error> {
+    let mut api = Api::init();
+
+    let stage2_pid = fork(|| {
+        api.parent.close().unwrap();
+        run_stage2(&mut api.child).expect("stage2");
+    }).unwrap();
+
+    api.child.close()?;
+
+    let mut reactor = Reactor::create();
+    reactor.run(&mut api.parent).expect("asd");
+
+    nix::sys::wait::waitpid(stage2_pid, None)?;
 
     return Ok(());
 }
