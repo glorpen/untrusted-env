@@ -230,7 +230,7 @@ fn run_stage2(api: &mut ChildSide) -> Result<(), Error> {
         info.group.id,
     )?;
 
-    fork(|| {
+    let pid = fork(|| {
         let init_path = _Path::from_iter([ROOT_INIT_PATH]);
         let init_new_path = _Path::from_iter([ROOT_INIT_PATH, NEW_ROOT_DIR]);
         let init_old_path = _Path::from_iter([ROOT_INIT_PATH, OLD_ROOT_DIR]);
@@ -248,11 +248,15 @@ fn run_stage2(api: &mut ChildSide) -> Result<(), Error> {
         run_stage3(&rootfs, info.borrow(), api).unwrap();
     })?;
 
+    nix::sys::wait::waitpid(pid, None)?;
+
     return Ok(());
 }
 
 pub fn run() -> Result<(), Error> {
     let mut api = Api::init();
+
+    api.parent.setup_stdio()?;
 
     let stage2_pid = fork(|| {
         api.parent.close().unwrap();
