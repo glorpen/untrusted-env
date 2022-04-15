@@ -4,6 +4,7 @@ use std::io::{Error, ErrorKind, Read, stderr, stdout, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
+use log::info;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
@@ -171,11 +172,11 @@ impl Api {
     //noinspection DuplicatedCode
     pub fn init() -> Api {
         let (parent_api_rd, child_api_wr) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
-        let (parent_api_wr, child_api_rd) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (child_api_rd, parent_api_wr) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
 
         let (parent_stdout_rd, child_stdout_wr) = nix::unistd::pipe().unwrap();
         fcntl(parent_stdout_rd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
-        let (parent_stdin_wr, child_stdin_rd) = nix::unistd::pipe().unwrap();
+        let (child_stdin_rd, parent_stdin_wr) = nix::unistd::pipe().unwrap();
         fcntl(parent_stdin_wr, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
         let (parent_stderr_rd, child_stderr_wr) = nix::unistd::pipe().unwrap();
         fcntl(parent_stderr_rd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
@@ -234,7 +235,7 @@ impl ReactorHandler for ParentSide {
     }
 
     fn get_total_watchable_files(&self) -> usize {
-        6
+        5
     }
 
     fn on_fd_event(&mut self, reactor: &Reactor, fd: RawFd) -> Result<(), IpcError> {
@@ -246,16 +247,18 @@ impl ReactorHandler for ParentSide {
             reactor.forward_data_sync(&mut self.child_io.stderr, stderr())?;
         } else if fd == self.child_io.stdout.as_raw_fd() {
             reactor.forward_data_sync(&mut self.child_io.stdout, stdout())?;
+        } else {
+            return Err(IpcError::UnhandledFd);
         }
 
-        return Err(IpcError::UnhandledFd);
+        return Ok(());
     }
 
     fn close(&self) -> Result<(), Error> {
         close(self.child_io.stdin.as_raw_fd())?;
         close(self.child_io.stdout.as_raw_fd())?;
         close(self.child_io.stderr.as_raw_fd())?;
-        close(self.stdin.as_raw_fd())?;
+        // close(self.stdin.as_raw_fd())?;
         close(self.messages.endpoint_r.as_raw_fd())?;
         close(self.messages.endpoint_w.as_raw_fd())?;
         return Ok(());
@@ -279,7 +282,7 @@ impl ReactorHandler for ChildSide {
     }
 
     fn close(&self) -> Result<(), Error> {
-        close(self.parent_io.stdin.as_raw_fd())?;
+        // close(self.parent_io.stdin.as_raw_fd())?;
         close(self.parent_io.stdout.as_raw_fd())?;
         close(self.parent_io.stderr.as_raw_fd())?;
         close(self.messages.endpoint_r.as_raw_fd())?;
@@ -288,16 +291,25 @@ impl ReactorHandler for ChildSide {
     }
 }
 
+fn adjust_fd(src: &mut File, current_fd: RawFd) -> Result<(), Error> {
+    dup2(src.as_raw_fd(), current_fd)?;
+    close(src.as_raw_fd())?;
+    *src = fd_as_file(current_fd);
+
+    return Ok(());
+}
+
+impl ParentSide {
+    pub fn setup_stdio(&mut self) -> Result<(), Error> {
+        // adjust_fd(&mut self.child_io.stdin, STDIN_FILENO)?;
+        // fcntl(self.stdin.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+
+        return Ok(());
+    }
+}
+
 impl ChildSide {
     pub fn setup_stdio(&mut self) -> Result<(), Error> {
-        fn adjust_fd(src: &mut File, current_fd: RawFd) -> Result<(), Error> {
-            dup2(src.as_raw_fd(), current_fd)?;
-            close(src.as_raw_fd())?;
-            *src = fd_as_file(current_fd);
-
-            return Ok(());
-        }
-
         adjust_fd(&mut self.parent_io.stdin, STDIN_FILENO)?;
         adjust_fd(&mut self.parent_io.stdout, STDOUT_FILENO)?;
         adjust_fd(&mut self.parent_io.stderr, STDERR_FILENO)?;
