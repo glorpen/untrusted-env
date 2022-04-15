@@ -60,8 +60,14 @@ impl<'x> RootFsView<'x> {
 
     fn assure_root_path<F>(&self, source_path: &Path, target_path: Option<&Path>, then: F) -> Result<(), Error>
         where F: FnOnce(&_Path, &_Path) -> Result<(), Error> {
-        let local_source_path = &(self.old_path / source_path);
-        let local_target_path = &(self.new_path / target_path.unwrap_or(source_path));
+        fn make_relative(path: &Path) -> &Path {
+            return if path.is_absolute() {
+                path.strip_prefix("/").unwrap()
+            } else { path };
+        }
+
+        let local_source_path = &(self.old_path / make_relative(source_path));
+        let local_target_path = &(self.new_path / make_relative(target_path.unwrap_or(source_path)));
 
         if !local_source_path.as_path().exists() {
             info!("Source path {} does not exist, skipping.", local_source_path);
