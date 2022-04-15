@@ -10,9 +10,6 @@ strip = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-#syscalls = "0.5.0"
-#sys-mount = "1.5.1"
-#unshare = "0.7.0"
 libc = "0.2.122"
 nix = "0.23.1"
 

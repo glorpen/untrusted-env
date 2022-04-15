@@ -1,0 +1,3 @@
+[submodule "vendor/libslirp"]
+	path = vendor/libslirp
+	url = https://gitlab.freedesktop.org/slirp/libslirp.git
