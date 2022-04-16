@@ -16,9 +16,28 @@ struct Timer {
     expire_timer_msec: i64
 }
 
-struct UserData<'x> {
+pub struct UserData<'x> {
     tapfd: RawFd,
     timers: Vec<&'x Timer>
+}
+
+impl<'x> UserData<'x> {
+    pub fn new(fd: RawFd) -> Self {
+        Self {
+            tapfd: fd,
+            timers: Vec::new()
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self as *const Self as *const c_void
+    }
+}
+
+impl Timer {
+    pub fn as_ptr(&self) -> *const c_void {
+        self as *const Self as *const c_void
+    }
 }
 
 unsafe extern "C" fn send_packet(pkt: *const c_void, pkt_len: size_t, opaque: *mut c_void) -> ssize_t
@@ -37,10 +56,10 @@ unsafe extern "C" fn clock_get_ns(_opaque: *mut c_void) -> i64
     clock_gettime(ClockId::CLOCK_MONOTONIC).unwrap().num_nanoseconds()
 }
 
-unsafe extern "C" fn timer_new(cb: SlirpTimerCb, cb_opaque: *mut c_void, opaque: *mut c_void) -> *mut c_void
+unsafe extern "C" fn timer_new(cb: SlirpTimerCb, cb_opaque: *const c_void, opaque: *mut c_void) -> *const c_void
 {
     let data = opaque as *mut UserData;
-    let t = Timer {
+    let mut t = Timer {
         cb,
         expire_timer_msec: -1,
         cb_opaque
@@ -48,24 +67,22 @@ unsafe extern "C" fn timer_new(cb: SlirpTimerCb, cb_opaque: *mut c_void, opaque:
 
     (*data).timers.push(&t);
 
-    // return std::ptr::addr_of_mut!((*data).timers.last_mut().unwrap());
-
-    return std::ptr::addr_of!(t) as *mut c_void;
+    return t.as_ptr();
 }
 
-unsafe extern "C" fn timer_free(timer: *mut c_void, opaque: *mut c_void)
+unsafe extern "C" fn timer_free(timer_ptr: *mut c_void, opaque_ptr: *mut c_void)
 {
-    let data = opaque as *mut UserData;
-    let timer_obj = timer as *const &Timer;
+    let data = opaque_ptr as *mut UserData;
+    let timer = timer_ptr as *mut Timer;
     (*data).timers.retain(|t| {
-        !std::ptr::eq(t, timer_obj)
+        !std::ptr::eq((*t).as_ptr(), (*timer).as_ptr())
     })
 }
 
-unsafe extern "C" fn timer_mod(timer: *mut c_void, expire_timer_msec: i64, _opaque: *mut c_void)
+unsafe extern "C" fn timer_mod(timer_ptr: *mut c_void, expire_timer_msec: i64, _opaque: *mut c_void)
 {
-    let data = timer as *mut Timer;
-    (*data).expire_timer_msec = expire_timer_msec
+    let timer = timer_ptr as *mut Timer;
+    (*timer).expire_timer_msec = expire_timer_msec
 }
 
 extern "C" fn register_poll_fd(_fd: c_int, _opaque: *mut c_void)
@@ -146,7 +163,7 @@ impl From<MyIpv4Addr> for in_addr {
 }
 
 
-pub fn init() -> *mut Slirp {
+pub fn init(data: &mut UserData) -> *const Slirp {
     let ipv6 = true;
     let ipv4 = true;
     let mtu = 0;
@@ -204,12 +221,9 @@ pub fn init() -> *mut Slirp {
         disable_dns,
         enable_emu: false,
     };
-    let mut data = UserData {
-        tapfd: 0,
-        timers: Vec::new()
-    };
 
-    return unsafe { slirp_new(&config, &cb, std::ptr::addr_of_mut!(data) as *mut c_void) };
+    // std::ptr::addr_of_mut!(data) as *const c_void
+    return unsafe { slirp_new(&config, &cb, data.as_ptr()) };
 }
 
 pub fn cleanup(handle: *mut Slirp) {

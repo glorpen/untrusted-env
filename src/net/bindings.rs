@@ -36,15 +36,15 @@ pub struct SlirpCb {
     pub send_packet: SlirpWriteCb,
     pub guest_error: unsafe extern "C" fn(
         msg: *const c_char,
-        opaque: *mut c_void,
+        opaque_ptr: *mut c_void,
     ),
     pub clock_get_ns: unsafe extern "C" fn(opaque: *mut c_void) -> i64,
     pub timer_new: Option<
         unsafe extern "C" fn(
             cb: SlirpTimerCb,
-            cb_opaque: *mut c_void,
-            opaque: *mut c_void,
-        ) -> *mut c_void,
+            cb_opaque_ptr: *const c_void,
+            opaque_ptr: *mut c_void,
+        ) -> *const c_void,
     >,
     pub timer_free: Option<
         unsafe extern "C" fn(
@@ -54,14 +54,14 @@ pub struct SlirpCb {
     >,
     pub timer_mod: Option<
         unsafe extern "C" fn(
-            timer: *mut c_void,
+            timer_ptr: *mut c_void,
             expire_time: i64,
-            opaque: *mut c_void,
+            opaque_ptr: *mut c_void,
         ),
     >,
-    pub register_poll_fd: unsafe extern "C" fn(fd: c_int, opaque: *mut c_void),
-    pub unregister_poll_fd: unsafe extern "C" fn(fd: c_int, opaque: *mut c_void),
-    pub notify: unsafe extern "C" fn(opaque: *mut c_void),
+    pub register_poll_fd: unsafe extern "C" fn(fd: c_int, opaque_ptr: *mut c_void),
+    pub unregister_poll_fd: unsafe extern "C" fn(fd: c_int, opaque_ptr: *mut c_void),
+    pub notify: unsafe extern "C" fn(opaque_ptr: *mut c_void),
 }
 
 #[repr(C)]
@@ -99,8 +99,8 @@ extern "C" {
     pub fn slirp_new(
         cfg: *const SlirpConfig,
         callbacks: *const SlirpCb,
-        opaque: *mut c_void,
-    ) -> *mut Slirp;
+        opaque: *const c_void,
+    ) -> *const Slirp;
     pub fn slirp_cleanup(slirp: *mut Slirp);
     pub fn slirp_pollfds_fill(
         slirp: *mut Slirp,
