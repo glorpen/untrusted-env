@@ -47,6 +47,10 @@ impl ScopedReactor {
 
         return true;
     }
+
+    pub fn clear(&mut self) {
+        self.fds.clear()
+    }
 }
 
 impl ReactorEvent {
@@ -211,6 +215,25 @@ impl<'x> MutableReactor for Reactor<'x> {
         } else if info.len() == 1 {
             // delete whole fd
             epoll_ctl(self.epoll_fd, EpollOp::EpollCtlDel, fd, None)?;
+        }
+
+        return Ok(());
+    }
+}
+
+impl MutableReactor for ScopedReactor {
+    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback) -> Result<(), Error> {
+        if ! self.fds.contains_key(&fd) {
+            self.fds.insert(fd, EventMap::new());
+        }
+        self.fds.get_mut(&fd).unwrap().insert(revent, handler);
+
+        return Ok(());
+    }
+
+    fn remove(&mut self, fd: RawFd, event: ReactorEvent) -> Result<(), Error> {
+        if self.fds.contains_key(&fd) {
+            self.fds.get_mut(&fd).unwrap().remove(&event);
         }
 
         return Ok(());
