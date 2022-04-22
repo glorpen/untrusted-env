@@ -28,6 +28,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
+type ReactorLoopCb = fn() -> isize;
+
 type EventCallback = fn(fd: RawFd) -> Result<(), Error>;
 
 type EventMap = HashMap<ReactorEvent, EventCallback>;
@@ -152,17 +154,20 @@ impl Reactor {
         return Ok(());
     }
 
-    /// to handle closing one should call remove() in callback and close fd
-    pub fn run(&mut self) -> Result<(), Error> {
-        let event = EpollEvent::new(EpollFlags::empty(), 0);
+    /// Run event loop.
+    ///
+    /// Use `config` param to change timeout and/or manage fd on each loop
+    /// To handle closing one should call remove() in callback and close fd.
+    pub fn run(&mut self, config: Option<ReactorLoopCb>) -> Result<(), Error> {
         let mut events: Vec<EpollEvent> = Vec::new();
 
         // when writing: write nonblocking until EAGAIN, add EPOLLOUT to watchlist, repeat until done sending, remove EPOLLOUT
 
         loop {
+            let timeout = config.map(|c| { c() }).unwrap_or(-1);
             events.resize(self.fds.len(), EpollEvent::empty());
 
-            let events_count = epoll_wait(self.epoll_fd, &mut events, 1000)?;
+            let events_count = epoll_wait(self.epoll_fd, &mut events, timeout)?;
             for i in 0..events_count {
                 let fd = events[i].data() as RawFd;
                 let flags = events[i].events();
