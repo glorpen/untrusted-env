@@ -4,11 +4,28 @@ use std::hash::Hash;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr;
-use nix::errno::Errno;
-use nix::Error;
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
+
+#[derive(Debug)]
+pub enum Error {
+    DuplicatedFdWithDifferentSource,
+    IoError(std::io::Error),
+    Errno(nix::errno::Errno),
+}
+
+impl From<nix::errno::Errno> for Error {
+    fn from(err: nix::errno::Errno) -> Self {
+        Error::Errno(err)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::IoError(err)
+    }
+}
 
 type EventCallback = fn(fd: RawFd) -> Result<(), Error>;
 
@@ -105,11 +122,10 @@ impl<'x> Reactor<'x> {
             if current.is_some() {
                 let current_source = current.unwrap().source;
                 if !(current_source.is_some() && source.is_some() && ptr::eq(current_source.unwrap(), source.unwrap())) {
-                    // TODO err
-                    return Err(Error::EFAULT);
+                    return Err(Error::DuplicatedFdWithDifferentSource);
                 }
                 if !(current_source.is_none() && source.is_none()) {
-                    return Err(Error::EFAULT);
+                    return Err(Error::DuplicatedFdWithDifferentSource);
                 }
             }
         }
@@ -137,7 +153,7 @@ impl<'x> Reactor<'x> {
         loop {
             events.resize(self.fds.len(), EpollEvent::empty());
 
-            let events_count = epoll_wait(self.epoll_fd, &mut events, 1000).expect("epoll wait");
+            let events_count = epoll_wait(self.epoll_fd, &mut events, 1000)?;
             for i in 0..events_count {
                 let fd = events[i].data() as RawFd;
                 let flags = events[i].events();
