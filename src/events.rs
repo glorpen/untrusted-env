@@ -6,6 +6,7 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
+use nix::unistd::close;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
@@ -28,8 +29,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-type ReactorLoopCb = fn() -> isize;
-
 type EventCallback = fn(fd: RawFd) -> Result<(), Error>;
 
 type EventMap = HashMap<ReactorEvent, EventCallback>;
@@ -46,7 +45,7 @@ struct EventHandler {
 type EventHandlerMap = HashMap<ReactorEvent, EventHandler>;
 
 struct Reactor {
-    epoll_fd: RawFd,
+    epoll_fd: Option<RawFd>,
     fds: HashMap<RawFd, EventHandlerMap>,
 }
 
@@ -107,10 +106,14 @@ trait MutableReactor {
     fn remove(&mut self, fd: RawFd, event: ReactorEvent) -> Result<(), Error>;
 }
 
+pub fn reactor_noop_config<T>(arg: T) -> isize {
+    -1
+}
+
 impl Reactor {
     pub fn create() -> Reactor {
         Reactor {
-            epoll_fd: epoll_create().unwrap(),
+            epoll_fd: Some(epoll_create().unwrap()),
             fds: Default::default(),
         }
     }
@@ -145,9 +148,9 @@ impl Reactor {
             let mut event = Some(EpollEvent::new(ReactorEvent::epoll_flags(infos.keys()), 0));
 
             if infos.len() > 1 {
-                epoll_ctl(self.epoll_fd, EpollOp::EpollCtlMod, fd, &mut event)?;
+                epoll_ctl(self.epoll_fd.unwrap(), EpollOp::EpollCtlMod, fd, &mut event)?;
             } else {
-                epoll_ctl(self.epoll_fd, EpollOp::EpollCtlAdd, fd, &mut event)?;
+                epoll_ctl(self.epoll_fd.unwrap(), EpollOp::EpollCtlAdd, fd, &mut event)?;
             }
         }
 
@@ -158,16 +161,26 @@ impl Reactor {
     ///
     /// Use `config` param to change timeout and/or manage fd on each loop
     /// To handle closing one should call remove() in callback and close fd.
-    pub fn run(&mut self, config: Option<ReactorLoopCb>) -> Result<(), Error> {
+    #[must_use]
+    fn run<T>(&mut self, mut config: T) -> Result<(), Error>
+        where T: FnMut(&mut Self) -> isize
+    {
         let mut events: Vec<EpollEvent> = Vec::new();
 
-        // when writing: write nonblocking until EAGAIN, add EPOLLOUT to watchlist, repeat until done sending, remove EPOLLOUT
-
         loop {
-            let timeout = config.map(|c| { c() }).unwrap_or(-1);
+            let timeout = config(self);
+            // configurator can stop reactor
+            if self.epoll_fd.is_none() { break; }
+
             events.resize(self.fds.len(), EpollEvent::empty());
 
-            let events_count = epoll_wait(self.epoll_fd, &mut events, timeout)?;
+            let events_count = {
+                let wait_result = epoll_wait(self.epoll_fd.unwrap(), &mut events, timeout);
+                if Err(nix::errno::Errno::EINTR) == wait_result && self.epoll_fd.is_none() { break; }
+
+                wait_result.unwrap()
+            };
+
             for i in 0..events_count {
                 let fd = events[i].data() as RawFd;
                 let flags = events[i].events();
@@ -177,14 +190,18 @@ impl Reactor {
                     let items = self.fds.get(&fd).unwrap();
                     for (event, handler) in items.iter() {
                         if flags.contains(event.to_epoll_flag()) {
-                            (handler.callback)(fd).expect("fd event");
+                            (handler.callback)(fd)?;
                         }
                     }
                 }
             }
         }
+
+        Ok(())
     }
 
+    /// Updates reactor descriptors from given scope.
+    /// To add, change or remove descriptors you have to call `update_scope` with mutated `ScopedReactor`.
     #[must_use]
     pub fn update_scope(&mut self, scope: &ScopedReactor) -> Result<(), Error> {
         let scope_ptr = ptr::addr_of!(*scope) as *const i32 as usize;
@@ -227,6 +244,20 @@ impl Reactor {
 
         return Ok(());
     }
+
+    pub fn shutdown(&mut self) {
+        if self.epoll_fd.is_some() {
+            close(self.epoll_fd.unwrap());
+            self.epoll_fd = None;
+        }
+    }
+}
+
+impl Drop for Reactor {
+    fn drop(&mut self) {
+        // TODO: check if double close is not happening
+        self.shutdown()
+    }
 }
 
 impl MutableReactor for Reactor {
@@ -243,10 +274,10 @@ impl MutableReactor for Reactor {
         if info.len() > 0 {
             // remove watching for single event
             let mut epoll_event = Some(EpollEvent::new(ReactorEvent::epoll_flags(info.keys()), 0));
-            epoll_ctl(self.epoll_fd, EpollOp::EpollCtlMod, fd, &mut epoll_event)?;
+            epoll_ctl(self.epoll_fd.unwrap(), EpollOp::EpollCtlMod, fd, &mut epoll_event)?;
         } else {
             // delete whole fd
-            epoll_ctl(self.epoll_fd, EpollOp::EpollCtlDel, fd, None)?;
+            epoll_ctl(self.epoll_fd.unwrap(), EpollOp::EpollCtlDel, fd, None)?;
         }
 
         return Ok(());
@@ -275,6 +306,8 @@ impl MutableReactor for ScopedReactor {
 #[cfg(test)]
 mod tests {
     use std::os::unix::io::RawFd;
+
+    use nix::unistd::{pipe, read};
 
     use crate::events::{Error, MutableReactor, Reactor, ReactorEvent, ScopedReactor};
 
@@ -328,5 +361,27 @@ mod tests {
         let ns = ScopedReactor::new();
         s.add_input(1, cb).unwrap();
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
+    }
+
+    #[test]
+    fn callbacks() {
+        let mut r = Reactor::create();
+        let (p_rd, p_wr) = pipe().unwrap();
+
+        r.add_input(p_rd, |fd| {
+            let mut buf = [0; 10];
+            read(fd, &mut buf);
+
+            Ok(())
+        });
+
+        let mut loop_count = 2;
+        r.run(|r| {
+            loop_count -= 1;
+            if loop_count <= 0 {
+                r.shutdown();
+            }
+            100
+        }).unwrap();
     }
 }
