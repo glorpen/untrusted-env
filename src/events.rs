@@ -5,16 +5,17 @@ use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
+use libc::{c_void, size_t};
+use nix::errno::Errno;
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
 use nix::unistd::{close, read, write};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
-const BUFFER_SIZE: usize = 1024;
-
 #[derive(Debug)]
 pub enum Error {
     DuplicatedFdWithDifferentSource,
+    EmptyRead,
     IoError(std::io::Error),
     Errno(nix::errno::Errno),
 }
@@ -31,7 +32,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-type EventCallback<S> = fn(fd: RawFd, state: &mut S) -> Result<(), Error>;
+type EventCallback<S> = fn(reactor: &mut Reactor<S>, state: &mut S) -> Result<(), Error>;
 
 type EventMap<S> = HashMap<ReactorEvent, EventCallback<S>>;
 
@@ -176,25 +177,37 @@ impl<S> Reactor<S> {
 
             events.resize(self.fds.len(), EpollEvent::empty());
 
-            let events_count = {
-                let wait_result = epoll_wait(self.epoll_fd.unwrap(), &mut events, timeout);
-                if Err(nix::errno::Errno::EINTR) == wait_result && self.epoll_fd.is_none() { break; }
-
-                wait_result.unwrap()
+            let events_count = match epoll_wait(self.epoll_fd.unwrap(), &mut events, timeout) {
+                Ok(res) => {
+                    res
+                }
+                Err(nix::errno::Errno::EINTR) => {
+                    if self.epoll_fd.is_none() { break; }
+                    0
+                }
+                Err(err) => {
+                    return Err(Error::Errno(err));
+                }
             };
 
             for i in 0..events_count {
                 let fd = events[i].data() as RawFd;
                 let flags = events[i].events();
 
+                let mut callbacks = Vec::new();
+
                 // TODO: gracefully handle errors
                 if self.fds.contains_key(&fd) {
                     let items = self.fds.get(&fd).unwrap();
                     for (event, handler) in items.iter() {
                         if flags.contains(event.to_epoll_flag()) {
-                            (handler.callback)(fd, state)?;
+                            callbacks.push(handler.callback);
                         }
                     }
+                }
+
+                for callback in callbacks {
+                    callback(self, state)?;
                 }
             }
         }
@@ -323,7 +336,7 @@ fn forward_iter<'x>(f_in: impl Iterator<Item=&'x [u8]>, send_buffer: &mut Vec<u8
     let mut written = forward_buffer(send_buffer, f_out)?;
     for data in f_in {
         send_buffer.extend_from_slice(data);
-        if send_buffer.len() >= BUFFER_SIZE {
+        if send_buffer.len() >= send_buffer.capacity() {
             written += forward_buffer(send_buffer, f_out)?;
         }
     }
@@ -332,26 +345,41 @@ fn forward_iter<'x>(f_in: impl Iterator<Item=&'x [u8]>, send_buffer: &mut Vec<u8
     Ok(written)
 }
 
+fn read_append(fd: RawFd, buffer: &mut Vec<u8>) -> Result<usize, Error> {
+    let offset = buffer.len();
+    let read_size = buffer.capacity() - offset;
+    if read_size <= 0 {
+        Err(Error::EmptyRead)
+    } else {
+        let res = unsafe { libc::read(fd, buffer[offset..].as_mut_ptr() as *mut c_void, read_size as size_t) };
+        let ret = nix::errno::Errno::result(res).map(|r| r as usize).map_err(|e| {
+            Error::Errno(e)
+        });
+
+        if ret.is_ok() {
+            unsafe { buffer.set_len(res as usize + offset) };
+        }
+
+        ret
+    }
+}
+
 #[must_use]
 fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<IOAction, Error> {
     let mut bytes_read = 0;
 
-    while buffer.len() <= BUFFER_SIZE {
-        let size = buffer.len();
-        match read(f_in, &mut buffer[size..]) {
+    while buffer.len() < buffer.capacity() {
+        match read_append(f_in, buffer) {
             Ok(size) => {
                 bytes_read += size;
             }
-            Err(nix::errno::Errno::EAGAIN) => {
+            Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
                 return Ok(IOAction::again(bytes_read));
             }
             Err(e) => {
-                return Err(Error::from(e))
+                return Err(Error::from(e));
             }
         };
-        if buffer.len() >= BUFFER_SIZE {
-            break;
-        }
     }
 
     Ok(IOAction::done(bytes_read))
@@ -359,20 +387,20 @@ fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<IOAction, Err
 
 struct IOAction {
     bytes_transferred: usize,
-    try_again: bool
+    try_again: bool,
 }
 
 impl IOAction {
     fn again(bytes_transferred: usize) -> Self {
         Self {
             bytes_transferred,
-            try_again: true
+            try_again: true,
         }
     }
     fn done(bytes_transferred: usize) -> Self {
         Self {
             bytes_transferred,
-            try_again: false
+            try_again: false,
         }
     }
 }
@@ -386,7 +414,7 @@ fn forward_fd(f_in: RawFd, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<IO
     let mut written_bytes: usize = 0;
 
     loop {
-        if ! reads_ended {
+        if !reads_ended {
             let read_info = read_fd_until_full(f_in, send_buffer)?;
             if read_info.try_again {
                 // read stream stopped
@@ -419,23 +447,14 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use nix::fcntl::OFlag;
+    use libc::{c_int, STDOUT_FILENO};
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::sys::resource::getrlimit;
     use nix::unistd::{pipe, pipe2, read, write};
 
-    use crate::events::{Error, EventCallback, MutableReactor, Reactor, ReactorEvent, ScopedReactor};
+    use crate::events::{Error, EventCallback, forward_buffer, forward_fd, MutableReactor, Reactor, reactor_noop_config, ReactorEvent, ScopedReactor};
 
-    struct State {
-        counter: usize,
-    }
-
-    impl State {
-        pub fn new() -> Self {
-            Self {
-                counter: 0
-            }
-        }
-    }
-
+    struct NoopState {}
 
     fn assert_fd_listeners_count<S>(reactor: &Reactor<S>, fd: RawFd, count: usize) {
         assert!(reactor.fds.contains_key(&fd));
@@ -444,10 +463,10 @@ mod tests {
 
     #[test]
     fn reactor_crud() {
-        let mut r = Reactor::<State>::create();
-        r.add(1, ReactorEvent::ReadyRead, |fd, state| { Ok(()) });
+        let mut r = Reactor::<NoopState>::create();
+        r.add(1, ReactorEvent::ReadyRead, |reactor, state| { Ok(()) });
         assert_fd_listeners_count(&r, 1, 1);
-        r.add(1, ReactorEvent::ReadyWrite, |fd, state| { Ok(()) });
+        r.add(1, ReactorEvent::ReadyWrite, |reactor, state| { Ok(()) });
         assert_fd_listeners_count(&r, 1, 2);
         r.remove(1, ReactorEvent::ReadyRead);
         assert_fd_listeners_count(&r, 1, 1);
@@ -460,8 +479,8 @@ mod tests {
         let global_fd = 1;
         let scope_fd = 2;
 
-        let mut r = Reactor::<State>::create();
-        let cb: EventCallback<State> = |fd, state| { Ok(()) };
+        let mut r = Reactor::<NoopState>::create();
+        let cb: EventCallback<NoopState> = |reactor, state| { Ok(()) };
         r.add(global_fd, ReactorEvent::ReadyRead, cb);
 
         let mut s = ScopedReactor::new();
@@ -484,7 +503,7 @@ mod tests {
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
 
         // add dublicated fd in another scope
-        let ns = ScopedReactor::<State>::new();
+        let ns = ScopedReactor::<NoopState>::new();
         s.add_input(1, cb).unwrap();
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
     }
@@ -500,21 +519,117 @@ mod tests {
         }, state).unwrap();
     }
 
+    fn write_until_full(fd: RawFd) -> usize {
+        let data: [u8; 1000] = [20; 1000];
+        let mut written = 0;
+        loop {
+            match write(fd, &data) {
+                Ok(size) => {
+                    written += size
+                }
+                Err(nix::errno::Errno::EAGAIN) => {
+                    break;
+                }
+                Err(e) => {
+                    panic!("{}", e);
+                }
+            }
+        }
+        return written;
+    }
+
     #[test]
     fn callbacks() {
-        let mut r = Reactor::create();
-        let (p_rd, p_wr) = pipe2(OFlag::O_NONBLOCK).unwrap();
-        let mut state = State::new();
-        let cb: EventCallback<State> = |fd, state| {
-            let mut buf = [0; 10];
-            state.counter += read(fd, &mut buf).unwrap();
-            Ok(())
+        struct State {
+            p1_wr: RawFd,
+            p1_rd: RawFd,
+            p2_wr: RawFd,
+            p2_rd: RawFd,
+            buffer: Vec<u8>,
+            writen: usize,
+            read: usize,
+            write_overflow: bool,
+            pipe_size: usize,
+        }
+
+        let mut state = {
+            let (p1_rd, p1_wr) = pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (p2_rd, p2_wr) = pipe2(OFlag::O_NONBLOCK).unwrap();
+
+            State {
+                p1_wr,
+                p1_rd,
+                p2_wr,
+                p2_rd,
+                buffer: Vec::with_capacity(200),
+                writen: 0,
+                read: 0,
+                write_overflow: false,
+                pipe_size: fcntl(p1_rd, FcntlArg::F_GETPIPE_SZ).unwrap() as usize,
+            }
         };
 
-        r.add_input(p_rd, cb);
+        let mut r = Reactor::<State>::create();
 
-        let written = write(p_wr, CString::new("test").unwrap().to_bytes()).unwrap();
-        run_reactor_once(&mut r, &mut state);
-        assert_eq!(written, state.counter);
+        // add some more when pipe is available
+        r.add_output(state.p1_wr, |r, state| {
+            // fill p1_wr
+            state.writen += write_until_full(state.p1_wr);
+
+            if state.writen > 2 * state.pipe_size {
+                r.remove(state.p1_wr, ReactorEvent::ReadyWrite)?;
+            }
+
+            Ok(())
+        }).unwrap();
+
+        // forward all data
+        r.add_input(state.p1_rd, |reactor, state| {
+            let ret = forward_fd(state.p1_rd, &mut state.buffer, state.p2_wr)?;
+
+            if ret.try_again {
+                // assert
+                state.write_overflow = true;
+                // write all data
+                reactor.add_output(state.p2_wr, |r, s| {
+                    let ret = forward_fd(s.p1_rd, &mut s.buffer, s.p2_wr)?;
+                    if !ret.try_again {
+                        // remove wr fd when done
+                        r.remove(s.p2_wr, ReactorEvent::ReadyWrite)?;
+                    }
+                    Ok(())
+                });
+
+                reactor.add_input(state.p2_rd, |r, s| {
+                    let mut buf: [u8; 100] = [0; 100];
+                    loop {
+                        match read(s.p2_rd, &mut buf) {
+                            Err(nix::errno::Errno::EAGAIN) => {
+                                if s.read == s.writen {
+                                    r.shutdown();
+                                }
+                                break;
+                            }
+                            Ok(size) => {
+                                s.read += size;
+                            }
+                            Err(e) => {
+                                return Err(Error::Errno(e));
+                            }
+                        }
+                    }
+
+                    Ok(())
+                }).unwrap();
+            }
+
+            Ok(())
+        }).unwrap();
+
+
+        r.run(|_| { 100 }, &mut state).unwrap();
+
+        assert_eq!(state.read, state.writen);
+        assert!(state.write_overflow);
     }
 }
