@@ -6,9 +6,11 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
-use nix::unistd::close;
+use nix::unistd::{close, read, write};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
+
+const BUFFER_SIZE: usize = 1024;
 
 #[derive(Debug)]
 pub enum Error {
@@ -301,6 +303,113 @@ impl<S> MutableReactor<S> for ScopedReactor<S> {
 
         return Ok(());
     }
+}
+
+#[must_use]
+fn forward_buffer(send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Error> {
+    let mut written: usize = 0;
+
+    while send_buffer.len() > 0 {
+        let size = write(f_out, send_buffer)?;
+        send_buffer.drain(0..size);
+        written += size;
+    }
+
+    Ok(written)
+}
+
+#[must_use]
+fn forward_iter<'x>(f_in: impl Iterator<Item=&'x [u8]>, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Error> {
+    let mut written = forward_buffer(send_buffer, f_out)?;
+    for data in f_in {
+        send_buffer.extend_from_slice(data);
+        if send_buffer.len() >= BUFFER_SIZE {
+            written += forward_buffer(send_buffer, f_out)?;
+        }
+    }
+    written += forward_buffer(send_buffer, f_out)?;
+
+    Ok(written)
+}
+
+#[must_use]
+fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<IOAction, Error> {
+    let mut bytes_read = 0;
+
+    while buffer.len() <= BUFFER_SIZE {
+        let size = buffer.len();
+        match read(f_in, &mut buffer[size..]) {
+            Ok(size) => {
+                bytes_read += size;
+            }
+            Err(nix::errno::Errno::EAGAIN) => {
+                return Ok(IOAction::again(bytes_read));
+            }
+            Err(e) => {
+                return Err(Error::from(e))
+            }
+        };
+        if buffer.len() >= BUFFER_SIZE {
+            break;
+        }
+    }
+
+    Ok(IOAction::done(bytes_read))
+}
+
+struct IOAction {
+    bytes_transferred: usize,
+    try_again: bool
+}
+
+impl IOAction {
+    fn again(bytes_transferred: usize) -> Self {
+        Self {
+            bytes_transferred,
+            try_again: true
+        }
+    }
+    fn done(bytes_transferred: usize) -> Self {
+        Self {
+            bytes_transferred,
+            try_again: false
+        }
+    }
+}
+
+#[must_use]
+fn forward_fd(f_in: RawFd, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<IOAction, Error> {
+    // add f_out to watchable if WouldBlock
+    // remove f_out from watchable if read_op would block and empty buffer
+
+    let mut reads_ended = false;
+    let mut written_bytes: usize = 0;
+
+    loop {
+        if ! reads_ended {
+            let read_info = read_fd_until_full(f_in, send_buffer)?;
+            if read_info.try_again {
+                // read stream stopped
+                reads_ended = true;
+            }
+        }
+
+        match forward_buffer(send_buffer, f_out) {
+            Ok(bytes) => {
+                written_bytes += bytes;
+            }
+            Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
+                return Ok(IOAction::again(written_bytes));
+            }
+            Err(e) => return Err(e)
+        };
+
+        if send_buffer.is_empty() {
+            break;
+        }
+    }
+
+    return Ok(IOAction::done(written_bytes));
 }
 
 #[cfg(test)]
