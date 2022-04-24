@@ -29,24 +29,24 @@ impl From<std::io::Error> for Error {
     }
 }
 
-type EventCallback = fn(fd: RawFd) -> Result<(), Error>;
+type EventCallback<S> = fn(fd: RawFd, state: &mut S) -> Result<(), Error>;
 
-type EventMap = HashMap<ReactorEvent, EventCallback>;
+type EventMap<S> = HashMap<ReactorEvent, EventCallback<S>>;
 
-struct ScopedReactor {
-    fds: HashMap<RawFd, EventMap>,
+struct ScopedReactor<S> {
+    fds: HashMap<RawFd, EventMap<S>>,
 }
 
-struct EventHandler {
-    callback: EventCallback,
+struct EventHandler<S> {
+    callback: EventCallback<S>,
     scope: Option<usize>,
 }
 
-type EventHandlerMap = HashMap<ReactorEvent, EventHandler>;
+type EventHandlerMap<S> = HashMap<ReactorEvent, EventHandler<S>>;
 
-struct Reactor {
+struct Reactor<S> {
     epoll_fd: Option<RawFd>,
-    fds: HashMap<RawFd, EventHandlerMap>,
+    fds: HashMap<RawFd, EventHandlerMap<S>>,
 }
 
 #[derive(EnumIter, Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -55,7 +55,7 @@ enum ReactorEvent {
     ReadyWrite,
 }
 
-impl ScopedReactor {
+impl<S> ScopedReactor<S> {
     fn new() -> Self {
         Self {
             fds: Default::default(),
@@ -92,16 +92,16 @@ impl ReactorEvent {
     }
 }
 
-trait MutableReactor {
-    fn add_input(&mut self, fd: RawFd, handler: EventCallback) -> Result<(), Error> {
+trait MutableReactor<S> {
+    fn add_input(&mut self, fd: RawFd, handler: EventCallback<S>) -> Result<(), Error> {
         self.add(fd, ReactorEvent::ReadyRead, handler)
     }
 
-    fn add_output(&mut self, fd: RawFd, handler: EventCallback) -> Result<(), Error> {
+    fn add_output(&mut self, fd: RawFd, handler: EventCallback<S>) -> Result<(), Error> {
         self.add(fd, ReactorEvent::ReadyWrite, handler)
     }
 
-    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback) -> Result<(), Error>;
+    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback<S>) -> Result<(), Error>;
 
     fn remove(&mut self, fd: RawFd, event: ReactorEvent) -> Result<(), Error>;
 }
@@ -110,15 +110,15 @@ pub fn reactor_noop_config<T>(arg: T) -> isize {
     -1
 }
 
-impl Reactor {
-    pub fn create() -> Reactor {
+impl<S> Reactor<S> {
+    pub fn create() -> Reactor<S> {
         Reactor {
             epoll_fd: Some(epoll_create().unwrap()),
             fds: Default::default(),
         }
     }
 
-    fn add_fd(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback, source: Option<&ScopedReactor>) -> Result<(), Error> {
+    fn add_fd(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback<S>, source: Option<&ScopedReactor<S>>) -> Result<(), Error> {
         if !self.fds.contains_key(&fd) {
             self.fds.insert(fd, EventHandlerMap::new());
         }
@@ -145,7 +145,7 @@ impl Reactor {
         }
 
         if infos.insert(revent, event_handler).is_none() {
-            let mut event = Some(EpollEvent::new(ReactorEvent::epoll_flags(infos.keys()), 0));
+            let mut event = Some(EpollEvent::new(ReactorEvent::epoll_flags(infos.keys()), fd as u64));
 
             if infos.len() > 1 {
                 epoll_ctl(self.epoll_fd.unwrap(), EpollOp::EpollCtlMod, fd, &mut event)?;
@@ -162,7 +162,7 @@ impl Reactor {
     /// Use `config` param to change timeout and/or manage fd on each loop
     /// To handle closing one should call remove() in callback and close fd.
     #[must_use]
-    fn run<T>(&mut self, mut config: T) -> Result<(), Error>
+    fn run<T>(&mut self, mut config: T, state: &mut S) -> Result<(), Error>
         where T: FnMut(&mut Self) -> isize
     {
         let mut events: Vec<EpollEvent> = Vec::new();
@@ -190,7 +190,7 @@ impl Reactor {
                     let items = self.fds.get(&fd).unwrap();
                     for (event, handler) in items.iter() {
                         if flags.contains(event.to_epoll_flag()) {
-                            (handler.callback)(fd)?;
+                            (handler.callback)(fd, state)?;
                         }
                     }
                 }
@@ -203,7 +203,7 @@ impl Reactor {
     /// Updates reactor descriptors from given scope.
     /// To add, change or remove descriptors you have to call `update_scope` with mutated `ScopedReactor`.
     #[must_use]
-    pub fn update_scope(&mut self, scope: &ScopedReactor) -> Result<(), Error> {
+    pub fn update_scope(&mut self, scope: &ScopedReactor<S>) -> Result<(), Error> {
         let scope_ptr = ptr::addr_of!(*scope) as *const i32 as usize;
 
         let pending_removal = {
@@ -253,15 +253,15 @@ impl Reactor {
     }
 }
 
-impl Drop for Reactor {
+impl<S> Drop for Reactor<S> {
     fn drop(&mut self) {
         // TODO: check if double close is not happening
         self.shutdown()
     }
 }
 
-impl MutableReactor for Reactor {
-    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback) -> Result<(), Error> {
+impl<S> MutableReactor<S> for Reactor<S> {
+    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback<S>) -> Result<(), Error> {
         self.add_fd(fd, revent, handler, None)
     }
 
@@ -284,8 +284,8 @@ impl MutableReactor for Reactor {
     }
 }
 
-impl MutableReactor for ScopedReactor {
-    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback) -> Result<(), Error> {
+impl<S> MutableReactor<S> for ScopedReactor<S> {
+    fn add(&mut self, fd: RawFd, revent: ReactorEvent, handler: EventCallback<S>) -> Result<(), Error> {
         if !self.fds.contains_key(&fd) {
             self.fds.insert(fd, EventMap::new());
         }
@@ -305,23 +305,40 @@ impl MutableReactor for ScopedReactor {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::{CStr, CString};
     use std::os::unix::io::RawFd;
+    use std::thread;
+    use std::time::Duration;
+    use nix::fcntl::OFlag;
 
-    use nix::unistd::{pipe, read};
+    use nix::unistd::{pipe, pipe2, read, write};
 
-    use crate::events::{Error, MutableReactor, Reactor, ReactorEvent, ScopedReactor};
+    use crate::events::{Error, EventCallback, MutableReactor, Reactor, ReactorEvent, ScopedReactor};
 
-    fn assert_fd_listeners_count(reactor: &Reactor, fd: RawFd, count: usize) {
+    struct State {
+        counter: usize
+    }
+
+    impl State {
+        pub fn new() -> Self {
+            Self {
+                counter: 0
+            }
+        }
+    }
+
+
+    fn assert_fd_listeners_count<S>(reactor: &Reactor<S>, fd: RawFd, count: usize) {
         assert!(reactor.fds.contains_key(&fd));
         assert_eq!(reactor.fds.get(&fd).unwrap().len(), count);
     }
 
     #[test]
     fn reactor_crud() {
-        let mut r = Reactor::create();
-        r.add(1, ReactorEvent::ReadyRead, |fd| { Ok(()) });
+        let mut r = Reactor::<State>::create();
+        r.add(1, ReactorEvent::ReadyRead, |fd, state| { Ok(()) });
         assert_fd_listeners_count(&r, 1, 1);
-        r.add(1, ReactorEvent::ReadyWrite, |fd| { Ok(()) });
+        r.add(1, ReactorEvent::ReadyWrite, |fd, state| { Ok(()) });
         assert_fd_listeners_count(&r, 1, 2);
         r.remove(1, ReactorEvent::ReadyRead);
         assert_fd_listeners_count(&r, 1, 1);
@@ -334,8 +351,8 @@ mod tests {
         let global_fd = 1;
         let scope_fd = 2;
 
-        let mut r = Reactor::create();
-        let cb = |fd| { Ok(()) };
+        let mut r = Reactor::<State>::create();
+        let cb: EventCallback<State> = |fd, state| { Ok(()) };
         r.add(global_fd, ReactorEvent::ReadyRead, cb);
 
         let mut s = ScopedReactor::new();
@@ -358,7 +375,7 @@ mod tests {
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
 
         // add dublicated fd in another scope
-        let ns = ScopedReactor::new();
+        let ns = ScopedReactor::<State>::new();
         s.add_input(1, cb).unwrap();
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
     }
@@ -366,22 +383,31 @@ mod tests {
     #[test]
     fn callbacks() {
         let mut r = Reactor::create();
-        let (p_rd, p_wr) = pipe().unwrap();
-
-        r.add_input(p_rd, |fd| {
+        let (p_rd, p_wr) = pipe2(OFlag::O_NONBLOCK).unwrap();
+        let mut state = State::new();
+        let cb: EventCallback<State> = |fd, state| {
             let mut buf = [0; 10];
-            read(fd, &mut buf);
-
+            state.counter += read(fd, &mut buf).unwrap();
             Ok(())
-        });
+        };
+
+        r.add_input(p_rd, cb);
 
         let mut loop_count = 2;
-        r.run(|r| {
+        r.run(|r: &mut Reactor<State>| {
+
             loop_count -= 1;
-            if loop_count <= 0 {
+            if loop_count == 1 {
+              thread::spawn(move || {
+                  thread::sleep(Duration::from_millis(50));
+                  let written = write(p_wr, CString::new("test").unwrap().to_bytes()).unwrap();
+              });
+            } else if loop_count <= 0 {
                 r.shutdown();
             }
             100
-        }).unwrap();
+        }, &mut state).unwrap();
+
+        assert_eq!(4, state.counter);
     }
 }
