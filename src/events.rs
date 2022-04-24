@@ -309,14 +309,14 @@ mod tests {
     use std::os::unix::io::RawFd;
     use std::thread;
     use std::time::Duration;
-    use nix::fcntl::OFlag;
 
+    use nix::fcntl::OFlag;
     use nix::unistd::{pipe, pipe2, read, write};
 
     use crate::events::{Error, EventCallback, MutableReactor, Reactor, ReactorEvent, ScopedReactor};
 
     struct State {
-        counter: usize
+        counter: usize,
     }
 
     impl State {
@@ -380,6 +380,17 @@ mod tests {
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
     }
 
+    fn run_reactor_once<T>(reactor: &mut Reactor<T>, state: &mut T) {
+        let mut iterations_count = 1;
+        reactor.run(|r: &mut Reactor<T>| {
+            if iterations_count <= 0 {
+                r.shutdown();
+            }
+            iterations_count -= 1;
+            100
+        }, state).unwrap();
+    }
+
     #[test]
     fn callbacks() {
         let mut r = Reactor::create();
@@ -393,21 +404,8 @@ mod tests {
 
         r.add_input(p_rd, cb);
 
-        let mut loop_count = 2;
-        r.run(|r: &mut Reactor<State>| {
-
-            loop_count -= 1;
-            if loop_count == 1 {
-              thread::spawn(move || {
-                  thread::sleep(Duration::from_millis(50));
-                  let written = write(p_wr, CString::new("test").unwrap().to_bytes()).unwrap();
-              });
-            } else if loop_count <= 0 {
-                r.shutdown();
-            }
-            100
-        }, &mut state).unwrap();
-
-        assert_eq!(4, state.counter);
+        let written = write(p_wr, CString::new("test").unwrap().to_bytes()).unwrap();
+        run_reactor_once(&mut r, &mut state);
+        assert_eq!(written, state.counter);
     }
 }
