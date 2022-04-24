@@ -1,15 +1,12 @@
-use std::borrow::{Borrow, BorrowMut};
-use std::collections::{HashMap, HashSet};
+use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::hash::Hash;
-use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr;
 
 use libc::{c_void, size_t};
-use nix::errno::Errno;
 use nix::sys::epoll::{epoll_create, epoll_ctl, epoll_wait, EpollEvent, EpollFlags, EpollOp};
-use nix::unistd::{close, read, write};
-use strum::IntoEnumIterator;
+use nix::unistd::{close, write};
 use strum_macros::EnumIter;
 
 #[derive(Debug)]
@@ -32,7 +29,7 @@ impl From<std::io::Error> for Error {
     }
 }
 
-type EventCallback<S> = fn(reactor: &mut Reactor<S>, state: &mut S) -> Result<(), Error>;
+type EventCallback<S> = fn(reactor: &mut Reactor<S>, state: &mut S);
 
 type EventMap<S> = HashMap<ReactorEvent, EventCallback<S>>;
 
@@ -109,8 +106,14 @@ trait MutableReactor<S> {
     fn remove(&mut self, fd: RawFd, event: ReactorEvent) -> Result<(), Error>;
 }
 
-pub fn reactor_noop_config<T>(arg: T) -> isize {
-    -1
+#[macro_export]
+macro_rules! reactor_run {
+    ($reactor:expr, $config:expr, $state:expr) => {
+        $reactor.run($config, $state)
+    };
+    ($reactor:expr, $state:expr) => {
+        $reactor.run(|_| { -1 }, $state)
+    };
 }
 
 impl<S> Reactor<S> {
@@ -162,16 +165,16 @@ impl<S> Reactor<S> {
 
     /// Run event loop.
     ///
-    /// Use `config` param to change timeout and/or manage fd on each loop
+    /// Use `pre_configurator` param to change timeout and/or manage fd on each loop
     /// To handle closing one should call remove() in callback and close fd.
     #[must_use]
-    fn run<T>(&mut self, mut config: T, state: &mut S) -> Result<(), Error>
+    pub fn run<T>(&mut self, mut pre_configurator: T, state: &mut S) -> Result<(), Error>
         where T: FnMut(&mut Self) -> isize
     {
         let mut events: Vec<EpollEvent> = Vec::new();
 
         loop {
-            let timeout = config(self);
+            let timeout = pre_configurator(self);
             // configurator can stop reactor
             if self.epoll_fd.is_none() { break; }
 
@@ -207,7 +210,7 @@ impl<S> Reactor<S> {
                 }
 
                 for callback in callbacks {
-                    callback(self, state)?;
+                    callback(self, state);
                 }
             }
         }
@@ -262,7 +265,7 @@ impl<S> Reactor<S> {
 
     pub fn shutdown(&mut self) {
         if self.epoll_fd.is_some() {
-            close(self.epoll_fd.unwrap());
+            close(self.epoll_fd.unwrap()).unwrap();
             self.epoll_fd = None;
         }
     }
@@ -319,7 +322,7 @@ impl<S> MutableReactor<S> for ScopedReactor<S> {
 }
 
 #[must_use]
-fn forward_buffer(send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Error> {
+pub fn forward_buffer(send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Error> {
     let mut written: usize = 0;
 
     while send_buffer.len() > 0 {
@@ -332,7 +335,7 @@ fn forward_buffer(send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Erro
 }
 
 #[must_use]
-fn forward_iter<'x>(f_in: impl Iterator<Item=&'x [u8]>, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Error> {
+pub fn forward_iter<'x>(f_in: impl Iterator<Item=&'x [u8]>, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<usize, Error> {
     let mut written = forward_buffer(send_buffer, f_out)?;
     for data in f_in {
         send_buffer.extend_from_slice(data);
@@ -345,7 +348,7 @@ fn forward_iter<'x>(f_in: impl Iterator<Item=&'x [u8]>, send_buffer: &mut Vec<u8
     Ok(written)
 }
 
-fn read_append(fd: RawFd, buffer: &mut Vec<u8>) -> Result<usize, Error> {
+pub fn read_append(fd: RawFd, buffer: &mut Vec<u8>) -> Result<usize, Error> {
     let offset = buffer.len();
     let read_size = buffer.capacity() - offset;
     if read_size <= 0 {
@@ -365,7 +368,7 @@ fn read_append(fd: RawFd, buffer: &mut Vec<u8>) -> Result<usize, Error> {
 }
 
 #[must_use]
-fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<IOAction, Error> {
+fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<PipeState, Error> {
     let mut bytes_read = 0;
 
     while buffer.len() < buffer.capacity() {
@@ -374,7 +377,7 @@ fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<IOAction, Err
                 bytes_read += size;
             }
             Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
-                return Ok(IOAction::again(bytes_read));
+                return Ok(PipeState::again(bytes_read));
             }
             Err(e) => {
                 return Err(Error::from(e));
@@ -382,15 +385,15 @@ fn read_fd_until_full(f_in: RawFd, buffer: &mut Vec<u8>) -> Result<IOAction, Err
         };
     }
 
-    Ok(IOAction::done(bytes_read))
+    Ok(PipeState::done(bytes_read))
 }
 
-struct IOAction {
+pub struct PipeState {
     bytes_transferred: usize,
     try_again: bool,
 }
 
-impl IOAction {
+impl PipeState {
     fn again(bytes_transferred: usize) -> Self {
         Self {
             bytes_transferred,
@@ -406,10 +409,7 @@ impl IOAction {
 }
 
 #[must_use]
-fn forward_fd(f_in: RawFd, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<IOAction, Error> {
-    // add f_out to watchable if WouldBlock
-    // remove f_out from watchable if read_op would block and empty buffer
-
+pub fn forward_fd(f_in: RawFd, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<PipeState, Error> {
     let mut reads_ended = false;
     let mut written_bytes: usize = 0;
 
@@ -427,7 +427,7 @@ fn forward_fd(f_in: RawFd, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<IO
                 written_bytes += bytes;
             }
             Err(Error::Errno(nix::errno::Errno::EAGAIN)) => {
-                return Ok(IOAction::again(written_bytes));
+                return Ok(PipeState::again(written_bytes));
             }
             Err(e) => return Err(e)
         };
@@ -437,22 +437,17 @@ fn forward_fd(f_in: RawFd, send_buffer: &mut Vec<u8>, f_out: RawFd) -> Result<IO
         }
     }
 
-    return Ok(IOAction::done(written_bytes));
+    return Ok(PipeState::done(written_bytes));
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{CStr, CString};
     use std::os::unix::io::RawFd;
-    use std::thread;
-    use std::time::Duration;
 
-    use libc::{c_int, STDOUT_FILENO};
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    use nix::sys::resource::getrlimit;
-    use nix::unistd::{pipe, pipe2, read, write};
+    use nix::unistd::{pipe2, read, write};
 
-    use crate::events::{Error, EventCallback, forward_buffer, forward_fd, MutableReactor, Reactor, reactor_noop_config, ReactorEvent, ScopedReactor};
+    use crate::events::{Error, EventCallback, forward_fd, MutableReactor, Reactor, ReactorEvent, ScopedReactor};
 
     struct NoopState {}
 
@@ -464,13 +459,13 @@ mod tests {
     #[test]
     fn reactor_crud() {
         let mut r = Reactor::<NoopState>::create();
-        r.add(1, ReactorEvent::ReadyRead, |reactor, state| { Ok(()) });
+        r.add(1, ReactorEvent::ReadyRead, |_reactor, _state| {}).unwrap();
         assert_fd_listeners_count(&r, 1, 1);
-        r.add(1, ReactorEvent::ReadyWrite, |reactor, state| { Ok(()) });
+        r.add(1, ReactorEvent::ReadyWrite, |_reactor, _state| {}).unwrap();
         assert_fd_listeners_count(&r, 1, 2);
-        r.remove(1, ReactorEvent::ReadyRead);
+        r.remove(1, ReactorEvent::ReadyRead).unwrap();
         assert_fd_listeners_count(&r, 1, 1);
-        r.remove(1, ReactorEvent::ReadyWrite);
+        r.remove(1, ReactorEvent::ReadyWrite).unwrap();
         assert_fd_listeners_count(&r, 1, 0);
     }
 
@@ -480,20 +475,20 @@ mod tests {
         let scope_fd = 2;
 
         let mut r = Reactor::<NoopState>::create();
-        let cb: EventCallback<NoopState> = |reactor, state| { Ok(()) };
-        r.add(global_fd, ReactorEvent::ReadyRead, cb);
+        let cb: EventCallback<NoopState> = |_reactor, _state| {};
+        r.add(global_fd, ReactorEvent::ReadyRead, cb).unwrap();
 
         let mut s = ScopedReactor::new();
 
-        s.add_output(global_fd, cb);
-        s.add_output(2, cb);
+        s.add_output(global_fd, cb).unwrap();
+        s.add_output(2, cb).unwrap();
 
         r.update_scope(&s).unwrap();
         assert_fd_listeners_count(&r, global_fd, 2);
         assert_fd_listeners_count(&r, scope_fd, 1);
 
         // remove existing fd and add a new one
-        s.remove(2, ReactorEvent::ReadyWrite);
+        s.remove(2, ReactorEvent::ReadyWrite).unwrap();
         r.update_scope(&s).unwrap();
 
         assert_fd_listeners_count(&r, scope_fd, 0);
@@ -502,10 +497,10 @@ mod tests {
         s.add_input(1, cb).unwrap();
         assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
 
-        // add dublicated fd in another scope
-        let ns = ScopedReactor::<NoopState>::new();
-        s.add_input(1, cb).unwrap();
-        assert!(matches!(r.update_scope(&s), Err(Error::DuplicatedFdWithDifferentSource)));
+        // add duplicated fd in another scope
+        let mut ns = ScopedReactor::<NoopState>::new();
+        ns.add_input(1, cb).unwrap();
+        assert!(matches!(r.update_scope(&ns), Err(Error::DuplicatedFdWithDifferentSource)));
     }
 
     fn run_reactor_once<T>(reactor: &mut Reactor<T>, state: &mut T) {
@@ -577,28 +572,25 @@ mod tests {
             state.writen += write_until_full(state.p1_wr);
 
             if state.writen > 2 * state.pipe_size {
-                r.remove(state.p1_wr, ReactorEvent::ReadyWrite)?;
+                r.remove(state.p1_wr, ReactorEvent::ReadyWrite).unwrap();
             }
-
-            Ok(())
         }).unwrap();
 
         // forward all data
         r.add_input(state.p1_rd, |reactor, state| {
-            let ret = forward_fd(state.p1_rd, &mut state.buffer, state.p2_wr)?;
+            let ret = forward_fd(state.p1_rd, &mut state.buffer, state.p2_wr).unwrap();
 
             if ret.try_again {
                 // assert
                 state.write_overflow = true;
                 // write all data
                 reactor.add_output(state.p2_wr, |r, s| {
-                    let ret = forward_fd(s.p1_rd, &mut s.buffer, s.p2_wr)?;
+                    let ret = forward_fd(s.p1_rd, &mut s.buffer, s.p2_wr).unwrap();
                     if !ret.try_again {
                         // remove wr fd when done
-                        r.remove(s.p2_wr, ReactorEvent::ReadyWrite)?;
+                        r.remove(s.p2_wr, ReactorEvent::ReadyWrite).unwrap();
                     }
-                    Ok(())
-                });
+                }).unwrap();
 
                 reactor.add_input(state.p2_rd, |r, s| {
                     let mut buf: [u8; 100] = [0; 100];
@@ -614,20 +606,15 @@ mod tests {
                                 s.read += size;
                             }
                             Err(e) => {
-                                return Err(Error::Errno(e));
+                                panic!("{}", e);
                             }
                         }
                     }
-
-                    Ok(())
                 }).unwrap();
             }
-
-            Ok(())
         }).unwrap();
 
-
-        r.run(|_| { 100 }, &mut state).unwrap();
+        reactor_run!(r, &mut state).unwrap();
 
         assert_eq!(state.read, state.writen);
         assert!(state.write_overflow);
